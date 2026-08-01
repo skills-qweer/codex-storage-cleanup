@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 存储清理"
+  short_description: "安全审计并清理 CodexHome 缓存、日志与历史子代理记录"
+  default_prompt: "Use $codex-storage-cleanup to audit CodexHome storage and safely clean redundant data without deleting main conversations."
