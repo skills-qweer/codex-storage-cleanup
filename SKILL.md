@@ -14,7 +14,7 @@ Audit first, classify every byte, and keep destructive work narrow and verifiabl
 - Treat subagent cleanup as a separate explicit operation. Protect every active main thread and active subagent; skip ambiguous status.
 - Resolve every destructive target to an absolute path below the requested CodexHome. Refuse reparse points and paths that escape the expected parent.
 - Do not run cache cleanup or SQLite maintenance while `ChatGPT.exe` or `codex.exe` is running. A skill invocation inside Codex can audit and prepare the command, but offline execution must happen after the user exits Codex and any VS Code Codex extension hosts.
-- Before subagent or database mutation, create a manifest and a recoverable backup outside CodexHome. Use a small canary first.
+- Before database maintenance, create a recoverable database backup outside CodexHome. Before subagent cleanup, write a manifest and temporary online backups of `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` outside CodexHome; do not duplicate every rollout by default. Use one candidate root as a canary.
 - Preserve unrelated user changes and never create or alter a project repository unless the user placed it in scope.
 
 ## 1. Audit storage
@@ -101,10 +101,11 @@ Before deletion:
 
 1. Query current app threads and collaboration agents again.
 2. Confirm protected IDs, candidate count, root-subtree count, and exact bytes with the user.
-3. Back up `state_5.sqlite*` and each canary rollout outside CodexHome.
-4. Check `codex --version` and use the supported `codex delete --force <root-thread-id>` path. Delete candidate roots, not every descendant separately.
-5. Run one smallest canary. If deletion reports `agent_jobs`, missing tables, a schema mismatch, a locked file, or partial deletion, stop. Do not hand-delete JSONL or patch the live schema as an automatic fallback.
-6. Re-snapshot live agents before the bulk pass. Skip a subtree if it contains a protected ID, a new descendant, or a rollout modified after the manifest.
+3. Use the SQLite online-backup API to snapshot `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` into a temporary directory outside CodexHome. Keep the manifest and summary separately. Do not copy all candidate rollout files unless the user explicitly requests a full rollback archive; normal bulk deletion is irreversible.
+4. Check `codex --version` and run one candidate root through `codex delete --force <root-thread-id>`. Delete a root once, not every descendant separately.
+5. If the canary reports `agent_jobs`, a missing table, or a schema mismatch, stop and prove the exact CLI/schema incompatibility before doing anything else. The previous verified workaround was to create empty temporary compatibility tables only after database backup, retry the canary through the supported delete path, and drop only those temporary objects after the batch. Never apply that workaround automatically or for a different error.
+6. For a large batch, use the local `codex app-server --stdio` `thread/delete` method one candidate root at a time. Before every root, compare the live subtree with the manifest, reject protected or unexpected descendants, and skip rollout files modified after the snapshot. Stop on a timeout, lock, RPC failure, or partial deletion.
+7. Re-snapshot live app threads and collaboration agents before each batch, including descendants under an active main thread. A completed descendant may be deleted only when its live task status is finished and its subtree contains no protected ID.
 
 After deletion, verify all of the following:
 
@@ -113,6 +114,8 @@ After deletion, verify all of the following:
 - `PRAGMA quick_check` is `ok` for state, goals, memories, and logs databases;
 - skipped and failed counts are reported separately;
 - before/after physical size is reported.
+
+After every check passes, remove any temporary compatibility objects and run `quick_check` again. If the user wants net disk reclamation, delete the temporary database backups and helper files after reporting that the deleted subagent history is then no longer recoverable. Keep the compact manifest and result logs in the task output directory.
 
 Main conversations and archived conversations are outside this module even when idle. Delete them only through a separate, explicitly authorized task-ID selection.
 
