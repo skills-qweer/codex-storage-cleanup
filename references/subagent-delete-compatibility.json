@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-02",
+  "review_after": "2026-11-01",
+  "policy": {
+    "version_alone_is_never_sufficient": true,
+    "backup_max_age_minutes": 60,
+    "failure_evidence_max_age_hours": 24,
+    "compat_install_max_age_hours": 24,
+    "unknown_combinations": "stop_and_update_skill",
+    "automatic_database_workaround": false,
+    "automatic_repository_merge": false
+  },
+  "profiles": [
+    {
+      "id": "codex-0.142.2-state-migration-42-missing-agent-jobs-v1",
+      "status": "manual_compat_only",
+      "validated_at": "2026-08-02",
+      "review_after": "2026-11-01",
+      "codex_cli_versions": [
+        "0.142.2"
+      ],
+      "state_database": "state_5.sqlite",
+      "migration": {
+        "max_successful": 42,
+        "required": [
+          {
+            "version": 14,
+            "description": "agent jobs",
+            "success": 1,
+            "checksum_hex": "12275BDF6BD1685525DBB54C37DDF62608D10F9F66110D7BB0DE55EE25A8B283E46D97CB8EABED7564F9752E3967BA8A"
+          },
+          {
+            "version": 15,
+            "description": "agent jobs max runtime seconds",
+            "success": 1,
+            "checksum_hex": "8104857BCB63E9665C77DDCB8186BE1BB630D9472FE215A0FADD62566FE33ABDA9CB223602506F2187F2BDD09D01105E"
+          },
+          {
+            "version": 42,
+            "description": "drop agent jobs",
+            "success": 1,
+            "checksum_hex": "815A1F0CBE21AC7F0653FB67C8E9702FD0EBB5F0A54CE644893B66D18614D9C8988510458B68FBD671B8632EF363B36A"
+          }
+        ]
+      },
+      "failure_fingerprint": {
+        "official_cli_result": "failed to delete session",
+        "error_substring": "no such table: agent_jobs",
+        "partial_deletion": {
+          "rollout_file_absent": true,
+          "state_thread_row_present": true,
+          "spawn_edge_present": true,
+          "state_quick_check": "ok"
+        },
+        "safety_state": {
+          "bulk_delete_started": false,
+          "other_authorized_roots_deleted": 0,
+          "database_backups_created": true,
+          "automatic_compatibility_workaround_applied": false
+        }
+      },
+      "objects": [
+        {
+          "name": "agent_jobs",
+          "type": "table",
+          "ddl": "CREATE TABLE agent_jobs (\n id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,\n instruction TEXT NOT NULL, output_schema_json TEXT,\n input_headers_json TEXT NOT NULL, input_csv_path TEXT NOT NULL,\n output_csv_path TEXT NOT NULL, auto_export INTEGER NOT NULL DEFAULT 1,\n created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,\n started_at INTEGER, completed_at INTEGER, last_error TEXT,\n max_runtime_seconds INTEGER\n)",
+          "normalized_sha256": "ebc00df15de0bac3fb0b0e807653b61d7f1589cf1dc2dc3f7ff150ebdeaae195"
+        },
+        {
+          "name": "agent_job_items",
+          "type": "table",
+          "ddl": "CREATE TABLE agent_job_items (\n job_id TEXT NOT NULL, item_id TEXT NOT NULL, row_index INTEGER NOT NULL,\n source_id TEXT, row_json TEXT NOT NULL, status TEXT NOT NULL,\n assigned_thread_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,\n result_json TEXT, last_error TEXT, created_at INTEGER NOT NULL,\n updated_at INTEGER NOT NULL, completed_at INTEGER, reported_at INTEGER,\n PRIMARY KEY (job_id, item_id),\n FOREIGN KEY(job_id) REFERENCES agent_jobs(id) ON DELETE CASCADE\n)",
+          "normalized_sha256": "53eeaf3f0c6d72ba3a45b135d79e58aa73c60de23b27fa93c35b5b2ca4c4a872"
+        },
+        {
+          "name": "idx_agent_jobs_status",
+          "type": "index",
+          "ddl": "CREATE INDEX idx_agent_jobs_status ON agent_jobs(status, updated_at DESC)",
+          "normalized_sha256": "895f9a3fba66a2b807f3b29d7838b41cfd53734481e66c192ae0ad50b9a47fc6"
+        },
+        {
+          "name": "idx_agent_job_items_status",
+          "type": "index",
+          "ddl": "CREATE INDEX idx_agent_job_items_status ON agent_job_items(job_id, status, row_index ASC)",
+          "normalized_sha256": "17ac9763c095bcbe1c80dc8967cb22b791da86202acbab99bc29b73d60007b85"
+        }
+      ],
+      "install_order": [
+        "agent_jobs",
+        "agent_job_items",
+        "idx_agent_jobs_status",
+        "idx_agent_job_items_status"
+      ],
+      "remove_order": [
+        "idx_agent_job_items_status",
+        "idx_agent_jobs_status",
+        "agent_job_items",
+        "agent_jobs"
+      ],
+      "sources": [
+        {
+          "kind": "official_migration_create",
+          "url": "https://github.com/openai/codex/blob/rust-v0.142.2/codex-rs/state/migrations/0014_agent_jobs.sql"
+        },
+        {
+          "kind": "official_migration_alter",
+          "url": "https://github.com/openai/codex/blob/rust-v0.142.2/codex-rs/state/migrations/0015_agent_jobs_max_runtime_seconds.sql"
+        },
+        {
+          "kind": "official_migration_drop",
+          "url": "https://github.com/openai/codex/blob/687f05cb946d10c96f90dd7ce82e11465c6e20a7/codex-rs/state/migrations/0042_drop_agent_jobs.sql"
+        },
+        {
+          "kind": "official_delete_implementation",
+          "url": "https://github.com/openai/codex/blob/rust-v0.142.2/codex-rs/state/src/runtime/threads.rs#L967-L1072"
+        }
+      ]
+    }
+  ]
+}
