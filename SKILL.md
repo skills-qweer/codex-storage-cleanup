@@ -15,7 +15,7 @@ Audit first, classify every byte, and keep destructive work narrow and verifiabl
 - Resolve every destructive target to an absolute path below the requested CodexHome. Refuse reparse points and paths that escape the expected parent.
 - Do not run cache cleanup or SQLite maintenance while `ChatGPT.exe` or `codex.exe` is running. A skill invocation inside Codex can audit and prepare the command, but offline execution must happen after the user exits Codex and any VS Code Codex extension hosts.
 - Before database maintenance, create a recoverable database backup outside CodexHome. Before subagent cleanup, write a manifest and temporary online backups of `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` outside CodexHome; do not duplicate every rollout by default. Use one candidate root as a canary.
-- Never infer delete compatibility from `codex --version` alone. Require the CLI version, migration maximum and checksums, SQLite object fingerprints, exact canary result, and fresh backup evidence to match a reviewed profile.
+- Never infer delete compatibility from `codex --version` or a familiar executable path alone. The native path requires a fresh desktop app-server process, an accessible mirror with the exact same size and SHA-256, a valid OpenAI Authenticode signature, reviewed migration anchors, absent compatibility objects, and a real canary. The legacy path requires an exact reviewed profile and tail certificate.
 - Preserve unrelated user changes and never create or alter a project repository unless the user placed it in scope.
 
 ## 1. Audit storage
@@ -90,7 +90,18 @@ Never delete a SQLite main, WAL, or SHM file individually while Codex is running
 
 ## 4. Audit and clean completed subagents
 
-Generate a read-only inventory. Pass every known active main-thread and subagent ID as `--protect`:
+Run the lightweight read-only preflight before scanning rollouts or creating backups:
+
+```powershell
+New-Item -ItemType Directory -Force 'C:\Codex-cleanup' | Out-Null
+python scripts\subagent_delete_compat.py preflight `
+  --codex-home 'D:\CodexHome' `
+  --output 'C:\Codex-cleanup\runtime-preflight.json'
+```
+
+Continue only when the fresh result says `allow_expensive_inventory: true`. A path or version match is insufficient: the selected mirror must match the currently running desktop app-server byte-for-byte and have a valid OpenAI signature. If preflight returns `unsupported_update_required`, `unsafe_stop`, an unavailable source, or any other deny result, do not enumerate all rollouts and do not create database backups. A scheduled automation must pause on that condition and deduplicate later notifications by the stable `condition_key`; it must not keep performing the same expensive blocked run.
+
+Only after the gate allows it, generate a read-only inventory. Pass every known active main-thread and subagent ID as `--protect`:
 
 ```powershell
 python scripts\subagent_inventory.py --codex-home 'D:\CodexHome' --protect THREAD_ID --output 'subagent-manifest.json'
@@ -100,22 +111,25 @@ The inventory uses only strong evidence: spawn edges, explicit agent metadata, o
 
 Before deletion:
 
-1. Query current app threads and collaboration agents again.
-2. Confirm protected IDs, candidate count, root-subtree count, and exact bytes with the user.
-3. Use the SQLite online-backup API to snapshot `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` into a temporary directory outside CodexHome. Keep the manifest and summary separately. Do not copy all candidate rollout files unless the user explicitly requests a full rollback archive; normal bulk deletion is irreversible.
-4. Run the bundled read-only compatibility diagnosis before the canary. A known profile still requires a real canary; an unknown or expired profile stops deletion.
-5. Check `codex --version` and run one candidate root through `codex delete --force <root-thread-id>`. Delete a root once, not every descendant separately.
-6. If the canary fails, save the raw CLI/app-server error and the exact partial-deletion state. Re-run diagnosis with that evidence and a newly generated external backup summary. Only `known_workaround_eligible` may proceed to a separately authorized temporary install.
-7. For a large batch, use the local `codex app-server --stdio` `thread/delete` method one candidate root at a time. Before every root, compare the live subtree with the manifest, reject protected or unexpected descendants, and skip rollout files modified after the snapshot. Stop on a timeout, lock, RPC failure, or partial deletion.
+1. Re-run preflight immediately before every official canary/delete invocation and require the same `condition_key`; any runtime, process, migration, or schema change stops that root.
+2. Query current app threads and collaboration agents, then confirm protected IDs, candidate count, root-subtree count, exact bytes, and mtimes.
+3. Write the manifest, then use the SQLite online-backup API to snapshot `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` into a temporary directory outside CodexHome. Keep the manifest and summary separately. Do not copy all candidate rollout files unless the user explicitly requests a full rollback archive; normal bulk deletion is irreversible.
+4. Run the full read-only diagnosis with the same fresh runtime evidence and backup summary. Only the native path may start a new official canary; legacy `0.142.2` is recovery-only for an already existing exact partial-deletion incident.
+5. Run one candidate root through the official delete path using only the executable named by the validated runtime evidence. Delete a root once, not every descendant separately.
+6. A native-runtime canary failure is `unsafe_stop`: save the raw CLI/app-server error and exact partial-deletion state, but never install the legacy shim or retry automatically. Only the exact legacy `0.142.2` incident may be re-diagnosed for `known_workaround_eligible`.
+7. For a large batch, use that same validated runtime's local `app-server --stdio` `thread/delete` method one candidate root at a time. Before every root, compare the live subtree with the manifest, reject protected or unexpected descendants, and skip rollout files modified after the snapshot. Stop on a timeout, lock, RPC failure, or partial deletion.
 8. Re-snapshot live app threads and collaboration agents before each batch, including descendants under an active main thread. A completed descendant may be deleted only when its live task status is finished and its subtree contains no protected ID.
 
-Run the read-only diagnosis from the skill root:
+Run the read-only diagnosis from the skill root with the preflight evidence:
 
 ```powershell
-python scripts\subagent_delete_compat.py diagnose --codex-home 'D:\CodexHome'
+python scripts\subagent_delete_compat.py diagnose `
+  --codex-home 'D:\CodexHome' `
+  --runtime-evidence 'C:\Codex-cleanup\runtime-preflight.json' `
+  --backup-summary 'C:\Codex-cleanup\db-backup-summary.json'
 ```
 
-For a failed canary, pass the unedited incident evidence and fresh backup summary:
+For recovery of an already existing exact legacy `0.142.2` partial-deletion incident, pass the unedited incident evidence and fresh backup summary. Never use this command after a native canary failure:
 
 ```powershell
 python scripts\subagent_delete_compat.py diagnose `
@@ -126,13 +140,13 @@ python scripts\subagent_delete_compat.py diagnose `
 
 Interpret decisions exactly:
 
-- `canary_required`: run one official canary; never install the workaround pre-emptively.
+- `canary_required`: run one official canary with the validated runtime; never install the workaround pre-emptively.
 - `known_workaround_eligible`: the only state in which an explicitly authorized compatibility install may be planned.
 - `compat_installed`: do not reinstall; continue only the original incident and retain the matching install result for removal.
 - `stale_profile_update_required` or `unsupported_update_required`: stop deletion and use the update lifecycle below.
 - `unsafe_stop`: preserve evidence and backups; do not retry, repair, or generalize the old fix.
 
-The currently reviewed workaround covers only CLI `0.142.2` plus successful migration 42 and the exact `no such table: agent_jobs` canary fingerprint. Read [references/subagent-delete-compatibility.md](references/subagent-delete-compatibility.md) and the machine profile before using it. Any different version, migration checksum, missing table, partial object set, non-empty compatibility table, lock, I/O error, failed backup, failed `quick_check`, timeout, protected-ID drift, or second canary failure must stop.
+The normal path is a desktop-native runtime at or above `0.145.0`, selected only after its mirror exactly matches the running bundled app-server and its OpenAI signature is valid. The only reviewed workaround remains the legacy CLI `0.142.2` incident, now additionally bound to the exact independently reviewed migration tail 43 and 44 in [references/subagent-delete-tail-certificates.json](references/subagent-delete-tail-certificates.json), plus the exact `no such table: agent_jobs` canary fingerprint. It is not available after a native canary failure. Read [references/subagent-delete-compatibility.md](references/subagent-delete-compatibility.md) and both machine-readable files before using it. Any different version, migration ledger, checksum, source commit, missing table, partial object set, non-empty compatibility table, lock, I/O error, failed backup, failed `quick_check`, timeout, protected-ID drift, or second canary failure must stop.
 
 `install` and `remove` default to dry plans. Execution requires their printed confirmation tokens, audit output outside CodexHome, and separate user authorization. Live writes accept only the bundled profile from a clean reviewed repository where `main == origin/main`, plus the non-reparse `CodexHome\state_5.sqlite`. Install writes a `prepared` journal before its transaction, rechecks the live canary row, exact spawn-edge set, and rollout state, creates only the four reviewed empty objects, writes a `commit-pending` journal containing the resulting SQLite `schema_version` and object rootpages, then commits. It never edits `_sqlx_migrations` or calls a delete API. Failure evidence is valid for at most 24 hours. Automatic removal is limited to 24 hours and requires the matching journal, current CLI, run nonce, database identity, unchanged profile/evidence/backup hashes, unchanged `schema_version` and rootpages, exact object hashes, and empty tables. Do not hand-write or copy DDL from another database.
 
@@ -150,7 +164,7 @@ Main conversations and archived conversations are outside this module even when 
 
 ## 5. Compatibility freshness and skill updates
 
-Treat a profile as stale after its `review_after` date, when the CLI/schema combination is absent, or when the observed error/protocol differs. A newer Codex version is not assumed fixed: first update the compatibility knowledge, then run a new read-only diagnosis and one new canary. Never continue a partially deleted incident merely because source code was refreshed.
+Treat a profile as stale after its `review_after` date or when the observed runtime, signature, migration anchors, legacy tail, error, or protocol differs. A newer version is never trusted by version alone: it may use the native path only when the fresh running desktop app-server and signed mirror match exactly, the fixed-runtime minimum and migration anchors hold, and a new official canary succeeds. Never continue a partially deleted incident merely because source code was refreshed.
 
 Check the trusted repository without changing it:
 
@@ -172,6 +186,8 @@ When an update check is caused by a failed cleanup, pass `--incident-evidence`. 
 The updater also refuses a dirty tree, non-`main` branch, unexpected origin, diverged history, disabled TLS verification, network/authentication failure, or failed validation. It statically checks fetched front matter, JSON, Python compilation, PowerShell syntax, and test presence without executing newly fetched test code with the user's files, network, or Git credentials. It records the exact fetched commit, validates that commit in the temporary worktree, then rechecks HEAD, worktree, origin, the local `origin/main` value, remote SHA, and incident evidence immediately before merging that exact SHA with `--ff-only`. It never stashes, resets, rebases, force-pushes, changes remotes, updates the Codex CLI, opens Codex databases, invokes deletion, pushes a branch, or merges a remote PR. Automatic fast-forward trusts the allow-listed `origin/main` maintainers and review process; static checks are not a proof that remote source is harmless.
 
 If trusted `origin/main` has no reviewed support for the new combination, stop live deletion. With explicit repository-update authorization, collect sanitized primary evidence, update the profile/script/docs and fixtures on a feature branch, run all tests, push only that branch, and create a Draft PR. Never commit secrets, write directly to `main`, auto-merge, or invent schema from an unknown database. Re-run diagnosis after a reviewed update; do not automatically retry the failed canary.
+
+For recurring automation, an unchanged unsupported condition is not a reason to repeat inventory and backups. Pause the cleanup, retain the first evidence bundle, and deduplicate reports by `condition_key`. The script does not change automation state: an operator must re-enable it through the Codex automation control only after a reviewed update and manual preflight/diagnosis validation; the resumed run performs the next canary under the normal gate.
 
 ## 6. Report the outcome
 

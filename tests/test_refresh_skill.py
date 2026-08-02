@@ -134,8 +134,138 @@ class RefreshSkillTests(unittest.TestCase):
         self.assertEqual(result["review_after"], "2026-10-01")
 
     def test_current_profile_hashes_validate(self) -> None:
-        profile = Path(__file__).resolve().parents[1] / "references" / "subagent-delete-compatibility.json"
-        refresh.validate_profile_file(profile)
+        root = Path(__file__).resolve().parents[1]
+        refresh.validate_compatibility_files(root)
+
+    def test_static_validator_rejects_weakened_native_runtime_controls(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "references"
+            / "subagent-delete-compatibility.json"
+        )
+        for field, value in (
+            ("requires_desktop_runtime_hash_match", False),
+            ("requires_valid_openai_signature", False),
+            ("official_canary_required", False),
+            ("workaround_allowed", True),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory(
+                prefix="profile-test-"
+            ) as temp:
+                profile = Path(temp) / "profile.json"
+                document = json.loads(source.read_text(encoding="utf-8"))
+                document["native_delete"][field] = value
+                profile.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaises(refresh.UpdateError):
+                    refresh.validate_profile_file(profile)
+
+    def test_static_validator_rejects_self_extended_review_dates(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "references"
+        with tempfile.TemporaryDirectory(prefix="review-date-test-") as temp:
+            root = Path(temp)
+            references = root / "references"
+            shutil.copytree(source, references)
+            profile_path = references / "subagent-delete-compatibility.json"
+            tail_path = references / "subagent-delete-tail-certificates.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            tail = json.loads(tail_path.read_text(encoding="utf-8"))
+            profile["review_after"] = "2099-12-31"
+            profile["profiles"][0]["review_after"] = "2099-12-31"
+            tail["review_after"] = "2099-12-31"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            tail_path.write_text(json.dumps(tail), encoding="utf-8")
+            with self.assertRaises(refresh.UpdateError):
+                refresh.validate_compatibility_files(root)
+
+    def test_incident_deleted_root_count_must_be_nonnegative_integer(self) -> None:
+        base = {
+            "schema_version": 1,
+            "partial_deletion": {
+                "rollout_file_absent": False,
+                "state_thread_row_present": False,
+                "spawn_edge_present": False,
+                "state_quick_check": "ok",
+            },
+            "safety_state": {
+                "bulk_delete_started": False,
+                "other_authorized_roots_deleted": 0,
+                "database_backups_created": True,
+                "automatic_compatibility_workaround_applied": False,
+            },
+        }
+        for invalid in (-1, 0.5, False):
+            with self.subTest(value=invalid), tempfile.TemporaryDirectory(
+                prefix="incident-count-test-"
+            ) as temp:
+                path = Path(temp) / "incident.json"
+                payload = json.loads(json.dumps(base))
+                payload["safety_state"]["other_authorized_roots_deleted"] = invalid
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                blockers = refresh.incident_blockers(path)
+                self.assertTrue(any("count is invalid" in item for item in blockers))
+
+    def test_static_validator_rejects_tail_range_wildcard_and_self_approval(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "references"
+            / "subagent-delete-tail-certificates.json"
+        )
+
+        def add_range(document: dict[str, object]) -> None:
+            document["chains"][0]["migration_range"] = "43-*"  # type: ignore[index]
+
+        def add_wildcard(document: dict[str, object]) -> None:
+            document["chains"][0]["migrations"][0]["source_url"] = (  # type: ignore[index]
+                "https://github.com/openai/codex/blob/*/codex-rs/state/migrations/"
+                "0043_threads_is_pinned.sql"
+            )
+
+        def add_self_approval(document: dict[str, object]) -> None:
+            document["chains"][0]["migrations"][0]["self_approved"] = True  # type: ignore[index]
+
+        for name, mutate in (
+            ("range", add_range),
+            ("wildcard", add_wildcard),
+            ("self-approval", add_self_approval),
+        ):
+            with self.subTest(case=name), tempfile.TemporaryDirectory(
+                prefix="tail-test-"
+            ) as temp:
+                certificate = Path(temp) / "tail.json"
+                document = json.loads(source.read_text(encoding="utf-8"))
+                mutate(document)
+                certificate.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaises(refresh.UpdateError):
+                    refresh.validate_tail_certificate_file(certificate)
+
+    def test_static_validator_rejects_self_declared_new_tail_migration(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "references"
+            / "subagent-delete-tail-certificates.json"
+        )
+        with tempfile.TemporaryDirectory(prefix="tail-test-") as temp:
+            certificate = Path(temp) / "tail.json"
+            document = json.loads(source.read_text(encoding="utf-8"))
+            chain = document["chains"][0]
+            invented = dict(chain["migrations"][-1])
+            invented.update(
+                {
+                    "version": 45,
+                    "description": "declared safe by this file",
+                    "source_commit": "a" * 40,
+                    "source_url": (
+                        "https://github.com/openai/codex/blob/"
+                        + "a" * 40
+                        + "/codex-rs/state/migrations/0045_declared_safe.sql"
+                    ),
+                }
+            )
+            chain["migrations"].append(invented)
+            chain["max_successful"] = 45
+            certificate.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaises(refresh.UpdateError):
+                refresh.validate_tail_certificate_file(certificate)
 
     def test_static_validator_rejects_self_hashed_unreviewed_ddl(self) -> None:
         source = (

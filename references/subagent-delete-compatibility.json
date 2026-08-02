@@ -1,28 +1,68 @@
 {
-  "schema_version": 1,
-  "updated_at": "2026-08-02",
+  "schema_version": 2,
+  "updated_at": "2026-08-03",
   "review_after": "2026-11-01",
   "policy": {
     "version_alone_is_never_sufficient": true,
     "backup_max_age_minutes": 60,
     "failure_evidence_max_age_hours": 24,
     "compat_install_max_age_hours": 24,
+    "runtime_evidence_max_age_minutes": 15,
     "unknown_combinations": "stop_and_update_skill",
     "automatic_database_workaround": false,
     "automatic_repository_merge": false
   },
+  "native_delete": {
+    "minimum_codex_cli_version": "0.145.0",
+    "requires_desktop_runtime_hash_match": true,
+    "requires_valid_openai_signature": true,
+    "required_migrations": [
+      {
+        "version": 14,
+        "description": "agent jobs",
+        "success": 1,
+        "checksum_hex": "12275BDF6BD1685525DBB54C37DDF62608D10F9F66110D7BB0DE55EE25A8B283E46D97CB8EABED7564F9752E3967BA8A"
+      },
+      {
+        "version": 15,
+        "description": "agent jobs max runtime seconds",
+        "success": 1,
+        "checksum_hex": "8104857BCB63E9665C77DDCB8186BE1BB630D9472FE215A0FADD62566FE33ABDA9CB223602506F2187F2BDD09D01105E"
+      },
+      {
+        "version": 42,
+        "description": "drop agent jobs",
+        "success": 1,
+        "checksum_hex": "815A1F0CBE21AC7F0653FB67C8E9702FD0EBB5F0A54CE644893B66D18614D9C8988510458B68FBD671B8632EF363B36A"
+      }
+    ],
+    "compatibility_objects": "must_be_absent",
+    "official_canary_required": true,
+    "workaround_allowed": false,
+    "sources": [
+      {
+        "kind": "official_drop_and_delete_fix",
+        "url": "https://github.com/openai/codex/commit/687f05cb946d10c96f90dd7ce82e11465c6e20a7"
+      },
+      {
+        "kind": "official_fixed_delete_implementation",
+        "url": "https://github.com/openai/codex/blob/rust-v0.146.0-alpha.9.2/codex-rs/state/src/runtime/threads.rs#L1042-L1090"
+      }
+    ]
+  },
   "profiles": [
     {
-      "id": "codex-0.142.2-state-migration-42-missing-agent-jobs-v1",
+      "id": "codex-0.142.2-state-migration-42-tail44-missing-agent-jobs-v2",
+      "delete_contract_id": "codex-0.142.2-delete-threads-strict-agent-jobs-v1",
       "status": "manual_compat_only",
-      "validated_at": "2026-08-02",
+      "validated_at": "2026-08-03",
       "review_after": "2026-11-01",
       "codex_cli_versions": [
         "0.142.2"
       ],
       "state_database": "state_5.sqlite",
       "migration": {
-        "max_successful": 42,
+        "base_through": 42,
         "required": [
           {
             "version": 14,
@@ -42,7 +82,8 @@
             "success": 1,
             "checksum_hex": "815A1F0CBE21AC7F0653FB67C8E9702FD0EBB5F0A54CE644893B66D18614D9C8988510458B68FBD671B8632EF363B36A"
           }
-        ]
+        ],
+        "tail_chain_id": "codex-state-42-to-44-delete-unrelated-v1"
       },
       "failure_fingerprint": {
         "official_cli_result": "failed to delete session",
@@ -109,7 +150,7 @@
         },
         {
           "kind": "official_migration_drop",
-          "url": "https://github.com/openai/codex/blob/687f05cb946d10c96f90dd7ce82e11465c6e20a7/codex-rs/state/migrations/0042_drop_agent_jobs.sql"
+          "url": "https://github.com/openai/codex/commit/687f05cb946d10c96f90dd7ce82e11465c6e20a7"
         },
         {
           "kind": "official_delete_implementation",
