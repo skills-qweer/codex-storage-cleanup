@@ -43,6 +43,59 @@ REVIEWED_OBJECT_SPECS = {
         "17ac9763c095bcbe1c80dc8967cb22b791da86202acbab99bc29b73d60007b85",
     ),
 }
+REVIEWED_MIGRATION_SPECS = {
+    14: (
+        "agent jobs",
+        "12275BDF6BD1685525DBB54C37DDF62608D10F9F66110D7BB0DE55EE25A8B283E46D97CB8EABED7564F9752E3967BA8A",
+    ),
+    15: (
+        "agent jobs max runtime seconds",
+        "8104857BCB63E9665C77DDCB8186BE1BB630D9472FE215A0FADD62566FE33ABDA9CB223602506F2187F2BDD09D01105E",
+    ),
+    42: (
+        "drop agent jobs",
+        "815A1F0CBE21AC7F0653FB67C8E9702FD0EBB5F0A54CE644893B66D18614D9C8988510458B68FBD671B8632EF363B36A",
+    ),
+}
+REVIEWED_TAIL_CHAIN_ID = "codex-state-42-to-44-delete-unrelated-v1"
+REVIEWED_DELETE_CONTRACT_ID = "codex-0.142.2-delete-threads-strict-agent-jobs-v1"
+REVIEWED_UPDATED_AT = "2026-08-03"
+REVIEWED_REVIEW_AFTER = "2026-11-01"
+REVIEWED_TAIL_MIGRATIONS = {
+    43: {
+        "description": "threads is pinned",
+        "checksum_hex": (
+            "9B2A199A557F5A92B0E27574E8BFC01DCE5EF28F106A3C16DFB3B8A6CD5679F3"
+            "B8BC26B63E09C461A9A0C1364F0B04BF"
+        ),
+        "source_commit": "400ee190c30d5e4a88549c070a2335311f0baa91",
+        "source_url": (
+            "https://github.com/openai/codex/blob/400ee190c30d5e4a88549c070a2335311f0baa91/"
+            "codex-rs/state/migrations/0043_threads_is_pinned.sql"
+        ),
+        "reviewed_effects": [
+            "add_column:threads.is_pinned",
+            "create_index:idx_threads_pinned_recency_at_ms",
+        ],
+        "delete_review": "delete_threads_strict body unchanged",
+    },
+    44: {
+        "description": "external agent config imports provider id",
+        "checksum_hex": (
+            "DFA22384943E691A089B9E8A6A8DA988EF1E25FF51DB7975CA42C3EC4BE474370F"
+            "262CAA77AEB5877EEEABBFF2C3CEB1"
+        ),
+        "source_commit": "ce803c45aed425b08b94d8e3c5fb7db0d2193568",
+        "source_url": (
+            "https://github.com/openai/codex/blob/ce803c45aed425b08b94d8e3c5fb7db0d2193568/"
+            "codex-rs/state/migrations/0044_external_agent_config_imports_provider_id.sql"
+        ),
+        "reviewed_effects": [
+            "add_nullable_column:external_agent_config_imports.provider_id"
+        ],
+        "delete_review": "no state thread runtime or thread_delete change",
+    },
+}
 
 
 class UpdateError(RuntimeError):
@@ -227,9 +280,8 @@ def incident_blockers(path: Path | None) -> list[str]:
             return ["incident evidence safety-state values are invalid"]
     if safety.get("bulk_delete_started") is True:
         blockers.append("incident evidence records that bulk deletion started")
-    try:
-        deleted_roots = int(safety.get("other_authorized_roots_deleted"))
-    except (TypeError, ValueError):
+    deleted_roots = safety.get("other_authorized_roots_deleted")
+    if type(deleted_roots) is not int or deleted_roots < 0:
         return ["incident evidence deleted-root count is invalid"]
     if deleted_roots > 0:
         blockers.append("incident evidence records deleted authorized roots")
@@ -299,79 +351,345 @@ def normalize_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
 
 
-def validate_profile_file(path: Path) -> None:
+def require_exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise UpdateError(f"{label} has unknown, missing, or self-approving fields")
+    return value
+
+
+def load_static_json(path: Path, label: str) -> dict[str, Any]:
     metadata = path.lstat()
     if path.is_symlink() or int(getattr(metadata, "st_file_attributes", 0)) & 0x400:
-        raise UpdateError("compatibility profile must not be a symlink or reparse point")
+        raise UpdateError(f"{label} must not be a symlink or reparse point")
     document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("schema_version") != 1 or not document.get("profiles"):
+    if not isinstance(document, dict):
+        raise UpdateError(f"{label} must be a JSON object")
+    return document
+
+
+def validate_required_migrations(value: Any, label: str) -> None:
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, dict) for item in value)
+        or [item.get("version") for item in value] != [14, 15, 42]
+    ):
+        raise UpdateError(f"{label} must contain only reviewed migrations 14, 15, and 42")
+    for item in value:
+        item = require_exact_keys(
+            item,
+            {"version", "description", "success", "checksum_hex"},
+            f"{label} entry",
+        )
+        version = item["version"]
+        description, checksum = REVIEWED_MIGRATION_SPECS[version]
+        if item != {
+            "version": version,
+            "description": description,
+            "success": 1,
+            "checksum_hex": checksum,
+        }:
+            raise UpdateError(f"{label} fingerprint differs for migration {version}")
+
+
+def validate_profile_file(path: Path) -> dict[str, Any]:
+    document = load_static_json(path, "compatibility profile")
+    require_exact_keys(
+        document,
+        {"schema_version", "updated_at", "review_after", "policy", "native_delete", "profiles"},
+        "compatibility profile",
+    )
+    if document.get("schema_version") != 2 or not isinstance(document.get("profiles"), list):
         raise UpdateError("compatibility profile has an unsupported shape")
     dt.date.fromisoformat(document["updated_at"])
     dt.date.fromisoformat(document["review_after"])
-    for profile in document["profiles"]:
-        dt.date.fromisoformat(profile["validated_at"])
-        dt.date.fromisoformat(profile["review_after"])
-        if profile.get("status") != "manual_compat_only":
-            raise UpdateError("compatibility profile has an unsupported status")
-        if profile.get("state_database") != "state_5.sqlite":
-            raise UpdateError("compatibility profile targets an unsupported database")
-        migration = profile.get("migration")
-        if not isinstance(migration, dict) or not isinstance(
-            migration.get("max_successful"), int
-        ):
-            raise UpdateError("compatibility profile migration rule is invalid")
-        required_migrations = migration.get("required")
-        if not isinstance(required_migrations, list) or not required_migrations:
-            raise UpdateError("compatibility profile required migrations are missing")
-        for item in required_migrations:
-            if (
-                not isinstance(item.get("version"), int)
-                or item.get("success") != 1
-                or not re.fullmatch(r"[0-9A-F]{96}", str(item.get("checksum_hex")))
-            ):
-                raise UpdateError("compatibility profile migration fingerprint is invalid")
-        objects = profile.get("objects")
+    if (
+        document["updated_at"] != REVIEWED_UPDATED_AT
+        or document["review_after"] != REVIEWED_REVIEW_AFTER
+    ):
+        raise UpdateError("compatibility profile review dates are not the reviewed release")
+    expected_policy = {
+        "version_alone_is_never_sufficient": True,
+        "backup_max_age_minutes": 60,
+        "failure_evidence_max_age_hours": 24,
+        "compat_install_max_age_hours": 24,
+        "runtime_evidence_max_age_minutes": 15,
+        "unknown_combinations": "stop_and_update_skill",
+        "automatic_database_workaround": False,
+        "automatic_repository_merge": False,
+    }
+    if document["policy"] != expected_policy:
+        raise UpdateError("compatibility profile policy weakens a reviewed fail-closed control")
+
+    native = require_exact_keys(
+        document["native_delete"],
+        {
+            "minimum_codex_cli_version",
+            "requires_desktop_runtime_hash_match",
+            "requires_valid_openai_signature",
+            "required_migrations",
+            "compatibility_objects",
+            "official_canary_required",
+            "workaround_allowed",
+            "sources",
+        },
+        "native delete policy",
+    )
+    validate_required_migrations(native["required_migrations"], "native delete migrations")
+    expected_native_sources = [
+        {
+            "kind": "official_drop_and_delete_fix",
+            "url": "https://github.com/openai/codex/commit/687f05cb946d10c96f90dd7ce82e11465c6e20a7",
+        },
+        {
+            "kind": "official_fixed_delete_implementation",
+            "url": (
+                "https://github.com/openai/codex/blob/rust-v0.146.0-alpha.9.2/"
+                "codex-rs/state/src/runtime/threads.rs#L1042-L1090"
+            ),
+        },
+    ]
+    if (
+        native["minimum_codex_cli_version"] != "0.145.0"
+        or native["requires_desktop_runtime_hash_match"] is not True
+        or native["requires_valid_openai_signature"] is not True
+        or native["compatibility_objects"] != "must_be_absent"
+        or native["official_canary_required"] is not True
+        or native["workaround_allowed"] is not False
+        or native["sources"] != expected_native_sources
+    ):
+        raise UpdateError("native delete policy differs from the reviewed runtime contract")
+
+    if len(document["profiles"]) != 1:
+        raise UpdateError("compatibility profile must contain exactly one reviewed legacy fallback")
+    profile = require_exact_keys(
+        document["profiles"][0],
+        {
+            "id",
+            "delete_contract_id",
+            "status",
+            "validated_at",
+            "review_after",
+            "codex_cli_versions",
+            "state_database",
+            "migration",
+            "failure_fingerprint",
+            "objects",
+            "install_order",
+            "remove_order",
+            "sources",
+        },
+        "legacy compatibility profile",
+    )
+    dt.date.fromisoformat(profile["validated_at"])
+    dt.date.fromisoformat(profile["review_after"])
+    if (
+        profile["validated_at"] != REVIEWED_UPDATED_AT
+        or profile["review_after"] != REVIEWED_REVIEW_AFTER
+    ):
+        raise UpdateError("legacy profile review dates are not the reviewed release")
+    if (
+        profile["id"]
+        != "codex-0.142.2-state-migration-42-tail44-missing-agent-jobs-v2"
+        or profile["delete_contract_id"] != REVIEWED_DELETE_CONTRACT_ID
+        or profile["status"] != "manual_compat_only"
+        or profile["codex_cli_versions"] != ["0.142.2"]
+        or profile["state_database"] != "state_5.sqlite"
+    ):
+        raise UpdateError("legacy compatibility profile identity is unsupported")
+
+    migration = require_exact_keys(
+        profile["migration"],
+        {"base_through", "required", "tail_chain_id"},
+        "legacy migration policy",
+    )
+    if migration["base_through"] != 42 or migration["tail_chain_id"] != REVIEWED_TAIL_CHAIN_ID:
+        raise UpdateError("legacy migration policy is not bound to the reviewed 42-to-44 tail")
+    validate_required_migrations(migration["required"], "legacy required migrations")
+
+    expected_failure = {
+        "official_cli_result": "failed to delete session",
+        "error_substring": "no such table: agent_jobs",
+        "partial_deletion": {
+            "rollout_file_absent": True,
+            "state_thread_row_present": True,
+            "spawn_edge_present": True,
+            "state_quick_check": "ok",
+        },
+        "safety_state": {
+            "bulk_delete_started": False,
+            "other_authorized_roots_deleted": 0,
+            "database_backups_created": True,
+            "automatic_compatibility_workaround_applied": False,
+        },
+    }
+    if profile["failure_fingerprint"] != expected_failure:
+        raise UpdateError("legacy failure fingerprint differs from the reviewed incident")
+
+    objects = profile["objects"]
+    if (
+        not isinstance(objects, list)
+        or len(objects) != len(REVIEWED_OBJECT_SPECS)
+        or [item.get("name") for item in objects if isinstance(item, dict)]
+        != list(REVIEWED_OBJECT_SPECS)
+    ):
+        raise UpdateError("compatibility profile object set is invalid")
+    for item in objects:
+        item = require_exact_keys(
+            item,
+            {"name", "type", "ddl", "normalized_sha256"},
+            "legacy compatibility object",
+        )
+        name = item["name"]
+        expected_type, expected_hash = REVIEWED_OBJECT_SPECS[name]
+        if item["type"] != expected_type:
+            raise UpdateError(f"compatibility profile changes the type of {name}")
+        ddl = item["ddl"]
+        if not isinstance(ddl, str) or ";" in ddl or "--" in ddl or "/*" in ddl:
+            raise UpdateError(f"compatibility profile SQL is unsafe for {name}")
+        digest = hashlib.sha256(normalize_sql(ddl).encode("utf-8")).hexdigest()
+        if digest != item["normalized_sha256"] or digest != expected_hash:
+            raise UpdateError(f"profile SQL hash differs for {name}")
+    if profile["install_order"] != [
+        "agent_jobs",
+        "agent_job_items",
+        "idx_agent_jobs_status",
+        "idx_agent_job_items_status",
+    ]:
+        raise UpdateError("compatibility profile install order is invalid")
+    if profile["remove_order"] != [
+        "idx_agent_job_items_status",
+        "idx_agent_jobs_status",
+        "agent_job_items",
+        "agent_jobs",
+    ]:
+        raise UpdateError("compatibility profile removal order is invalid")
+    expected_legacy_sources = [
+        {
+            "kind": "official_migration_create",
+            "url": "https://github.com/openai/codex/blob/rust-v0.142.2/codex-rs/state/migrations/0014_agent_jobs.sql",
+        },
+        {
+            "kind": "official_migration_alter",
+            "url": "https://github.com/openai/codex/blob/rust-v0.142.2/codex-rs/state/migrations/0015_agent_jobs_max_runtime_seconds.sql",
+        },
+        {
+            "kind": "official_migration_drop",
+            "url": "https://github.com/openai/codex/commit/687f05cb946d10c96f90dd7ce82e11465c6e20a7",
+        },
+        {
+            "kind": "official_delete_implementation",
+            "url": (
+                "https://github.com/openai/codex/blob/rust-v0.142.2/"
+                "codex-rs/state/src/runtime/threads.rs#L967-L1072"
+            ),
+        },
+    ]
+    if profile["sources"] != expected_legacy_sources:
+        raise UpdateError("legacy compatibility sources differ from reviewed official links")
+    return {
+        "tail_chain_ids": [migration["tail_chain_id"]],
+        "delete_contract_ids": [profile["delete_contract_id"]],
+        "review_after": document["review_after"],
+    }
+
+
+def validate_tail_certificate_file(path: Path) -> dict[str, Any]:
+    document = load_static_json(path, "tail certificate")
+    require_exact_keys(
+        document,
+        {"schema_version", "updated_at", "review_after", "chains"},
+        "tail certificate",
+    )
+    if document["schema_version"] != 1 or not isinstance(document["chains"], list):
+        raise UpdateError("tail certificate has an unsupported shape")
+    dt.date.fromisoformat(document["updated_at"])
+    dt.date.fromisoformat(document["review_after"])
+    if (
+        document["updated_at"] != REVIEWED_UPDATED_AT
+        or document["review_after"] != REVIEWED_REVIEW_AFTER
+    ):
+        raise UpdateError("tail certificate review dates are not the reviewed release")
+    if len(document["chains"]) != 1:
+        raise UpdateError("tail certificate must contain exactly one reviewed chain")
+    chain = require_exact_keys(
+        document["chains"][0],
+        {
+            "id",
+            "delete_contract_id",
+            "base_through",
+            "max_successful",
+            "classification",
+            "migrations",
+        },
+        "tail certificate chain",
+    )
+    if (
+        chain["id"] != REVIEWED_TAIL_CHAIN_ID
+        or chain["delete_contract_id"] != REVIEWED_DELETE_CONTRACT_ID
+        or chain["base_through"] != 42
+        or chain["max_successful"] != 44
+        or chain["classification"] != "reviewed_delete_unrelated"
+        or not isinstance(chain["migrations"], list)
+        or not all(isinstance(item, dict) for item in chain["migrations"])
+        or [item.get("version") for item in chain["migrations"]] != [43, 44]
+    ):
+        raise UpdateError("tail certificate is not the exact reviewed 43-to-44 chain")
+
+    migration_keys = {
+        "version",
+        "description",
+        "success",
+        "checksum_hex",
+        "source_commit",
+        "source_url",
+        "reviewed_effects",
+        "delete_review",
+    }
+    for item in chain["migrations"]:
+        item = require_exact_keys(item, migration_keys, "tail migration certificate")
+        version = item["version"]
+        expected = REVIEWED_TAIL_MIGRATIONS[version]
+        source_commit = item["source_commit"]
+        source_url = item["source_url"]
+        source_match = re.fullmatch(
+            r"https://github\.com/openai/codex/blob/([0-9a-f]{40})/.+",
+            str(source_url),
+        )
         if (
-            not isinstance(objects, list)
-            or len(objects) != len(REVIEWED_OBJECT_SPECS)
-            or {
-                item.get("name") for item in objects if isinstance(item, dict)
-            }
-            != set(REVIEWED_OBJECT_SPECS)
+            item["success"] != 1
+            or not re.fullmatch(r"[0-9a-f]{40}", str(source_commit))
+            or source_match is None
+            or source_match.group(1) != source_commit
+            or item["description"] != expected["description"]
+            or item["checksum_hex"] != expected["checksum_hex"]
+            or source_commit != expected["source_commit"]
+            or source_url != expected["source_url"]
+            or item["reviewed_effects"] != expected["reviewed_effects"]
+            or item["delete_review"] != expected["delete_review"]
         ):
-            raise UpdateError("compatibility profile object set is invalid")
-        for item in profile["objects"]:
-            name = item["name"]
-            expected_type, expected_hash = REVIEWED_OBJECT_SPECS[name]
-            if item.get("type") != expected_type:
-                raise UpdateError(f"compatibility profile changes the type of {name}")
-            ddl = item.get("ddl")
-            if not isinstance(ddl, str) or ";" in ddl or "--" in ddl or "/*" in ddl:
-                raise UpdateError(f"compatibility profile SQL is unsafe for {name}")
-            digest = hashlib.sha256(normalize_sql(item["ddl"]).encode("utf-8")).hexdigest()
-            if digest != item["normalized_sha256"] or digest != expected_hash:
-                raise UpdateError(f"profile SQL hash differs for {item['name']}")
-        if profile.get("install_order") != [
-            "agent_jobs",
-            "agent_job_items",
-            "idx_agent_jobs_status",
-            "idx_agent_job_items_status",
-        ]:
-            raise UpdateError("compatibility profile install order is invalid")
-        if profile.get("remove_order") != [
-            "idx_agent_job_items_status",
-            "idx_agent_jobs_status",
-            "agent_job_items",
-            "agent_jobs",
-        ]:
-            raise UpdateError("compatibility profile removal order is invalid")
-        sources = profile.get("sources")
-        if not isinstance(sources, list) or not sources or not all(
-            isinstance(item, dict)
-            and str(item.get("url", "")).startswith("https://github.com/openai/codex/")
-            for item in sources
-        ):
-            raise UpdateError("compatibility profile sources are not official Codex links")
+            raise UpdateError(
+                f"tail migration {version} lacks the exact immutable reviewed fingerprint"
+            )
+    return {
+        "tail_chain_ids": [chain["id"]],
+        "delete_contract_ids": [chain["delete_contract_id"]],
+        "review_after": document["review_after"],
+    }
+
+
+def validate_compatibility_files(root: Path) -> None:
+    profile = validate_profile_file(
+        root / "references" / "subagent-delete-compatibility.json"
+    )
+    tail = validate_tail_certificate_file(
+        root / "references" / "subagent-delete-tail-certificates.json"
+    )
+    if (
+        profile["tail_chain_ids"] != tail["tail_chain_ids"]
+        or profile["delete_contract_ids"] != tail["delete_contract_ids"]
+        or profile["review_after"] != tail["review_after"]
+    ):
+        raise UpdateError("compatibility profile and tail certificate are not bound together")
 
 
 def validate_skill_tree(root: Path) -> dict[str, Any]:
@@ -383,8 +701,8 @@ def validate_skill_tree(root: Path) -> dict[str, Any]:
     if "description:" not in frontmatter.group(1):
         raise UpdateError("SKILL.md description is missing")
     (root / "README.md").read_text(encoding="utf-8")
-    validate_profile_file(root / "references" / "subagent-delete-compatibility.json")
-    checks.append({"name": "skill-and-profile", "ok": True})
+    validate_compatibility_files(root)
+    checks.append({"name": "skill-profile-and-tail-certificate", "ok": True})
 
     python_files = sorted((root / "scripts").glob("*.py"))
     compile_result = subprocess.run(

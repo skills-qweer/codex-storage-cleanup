@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-03",
+  "review_after": "2026-11-01",
+  "chains": [
+    {
+      "id": "codex-state-42-to-44-delete-unrelated-v1",
+      "delete_contract_id": "codex-0.142.2-delete-threads-strict-agent-jobs-v1",
+      "base_through": 42,
+      "max_successful": 44,
+      "classification": "reviewed_delete_unrelated",
+      "migrations": [
+        {
+          "version": 43,
+          "description": "threads is pinned",
+          "success": 1,
+          "checksum_hex": "9B2A199A557F5A92B0E27574E8BFC01DCE5EF28F106A3C16DFB3B8A6CD5679F3B8BC26B63E09C461A9A0C1364F0B04BF",
+          "source_commit": "400ee190c30d5e4a88549c070a2335311f0baa91",
+          "source_url": "https://github.com/openai/codex/blob/400ee190c30d5e4a88549c070a2335311f0baa91/codex-rs/state/migrations/0043_threads_is_pinned.sql",
+          "reviewed_effects": [
+            "add_column:threads.is_pinned",
+            "create_index:idx_threads_pinned_recency_at_ms"
+          ],
+          "delete_review": "delete_threads_strict body unchanged"
+        },
+        {
+          "version": 44,
+          "description": "external agent config imports provider id",
+          "success": 1,
+          "checksum_hex": "DFA22384943E691A089B9E8A6A8DA988EF1E25FF51DB7975CA42C3EC4BE474370F262CAA77AEB5877EEEABBFF2C3CEB1",
+          "source_commit": "ce803c45aed425b08b94d8e3c5fb7db0d2193568",
+          "source_url": "https://github.com/openai/codex/blob/ce803c45aed425b08b94d8e3c5fb7db0d2193568/codex-rs/state/migrations/0044_external_agent_config_imports_provider_id.sql",
+          "reviewed_effects": [
+            "add_nullable_column:external_agent_config_imports.provider_id"
+          ],
+          "delete_review": "no state thread runtime or thread_delete change"
+        }
+      ]
+    }
+  ]
+}

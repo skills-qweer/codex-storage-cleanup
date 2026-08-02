@@ -41,6 +41,18 @@ MIGRATIONS = [
         1,
         "815A1F0CBE21AC7F0653FB67C8E9702FD0EBB5F0A54CE644893B66D18614D9C8988510458B68FBD671B8632EF363B36A",
     ),
+    (
+        43,
+        "threads is pinned",
+        1,
+        "9B2A199A557F5A92B0E27574E8BFC01DCE5EF28F106A3C16DFB3B8A6CD5679F3B8BC26B63E09C461A9A0C1364F0B04BF",
+    ),
+    (
+        44,
+        "external agent config imports provider id",
+        1,
+        "DFA22384943E691A089B9E8A6A8DA988EF1E25FF51DB7975CA42C3EC4BE474370F262CAA77AEB5877EEEABBFF2C3CEB1",
+    ),
 ]
 
 
@@ -191,10 +203,303 @@ class CompatibilityFixture(unittest.TestCase):
                 now=now,
             )
 
+    def _install_args(self, output: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            codex_home=str(self.codex_home),
+            profile_file=str(self.profile),
+            codex_exe=None,
+            failure_evidence=str(self.failure_path),
+            backup_summary=str(self.summary_path),
+            execute=True,
+            confirm_token=compat.INSTALL_TOKEN,
+            output=str(output),
+        )
+
+    def _remove_args(self, install_output: Path, output: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            codex_home=str(self.codex_home),
+            profile_file=str(self.profile),
+            install_result=str(install_output),
+            execute=True,
+            confirm_token=compat.REMOVE_TOKEN,
+            output=str(output),
+        )
+
+    def _install_legacy(self, output: Path) -> dict[str, object]:
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(
+                compat,
+                "require_live_codex_version",
+                return_value=None,
+            ),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+        ):
+            return compat.install_compat(self._install_args(output))
+
+    def _compat_object_names(self) -> set[str]:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN "
+                    "('agent_jobs','agent_job_items','idx_agent_jobs_status',"
+                    "'idx_agent_job_items_status')"
+                )
+            }
+
+    def _native_runtime(self, version: str = "0.146.0-alpha.9.2") -> dict[str, object]:
+        executable = self.codex_home / "plugins" / ".plugin-appserver" / "codex.exe"
+        return {
+            "captured_at": compat.iso_now(),
+            "ok": True,
+            "reason": None,
+            "desktop_process": {"process_id": 1234},
+            "bundled_backend": {"path": "C:/Program Files/WindowsApps/OpenAI.Codex/app/resources/codex.exe", "sha256": "a" * 64},
+            "mirror": {
+                "path": str(executable),
+                "sha256": "a" * 64,
+                "authenticode": {"status": "Valid", "subject": "OpenAI OpCo, LLC"},
+            },
+            "cli": version_result(version),
+        }
+
+    def _native_evidence(self) -> dict[str, object]:
+        runtime = self._native_runtime()
+        database = compat.inspect_preflight_database(
+            self.codex_home / "state_5.sqlite",
+            json.loads(self.profile.read_text(encoding="utf-8"))["native_delete"][
+                "required_migrations"
+            ],
+        )
+        return {
+            "schema_version": 2,
+            "operation": "preflight",
+            "decision": "canary_required",
+            "native_delete": True,
+            "allow_expensive_inventory": True,
+            "recommended_codex_exe": runtime["mirror"]["path"],
+            "runtime": runtime,
+            "database": database,
+            "condition_key": "a" * 64,
+        }
+
     def test_profile_document_validates(self) -> None:
         document = json.loads(self.profile.read_text(encoding="utf-8"))
         profiles = compat.validate_profile_document(document)
         self.assertEqual(len(profiles), 1)
+
+    def test_codex_version_preserves_prerelease_suffix(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout="codex-cli 0.146.0-alpha.9.2\n",
+            stderr="",
+        )
+        with mock.patch.object(compat.subprocess, "run", return_value=completed):
+            result = compat.read_codex_version("codex-test.exe")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["version"], "0.146.0-alpha.9.2")
+
+    def test_prerelease_runtime_meets_native_minimum(self) -> None:
+        self.assertTrue(compat.semver_at_least("0.146.0-alpha.9.2", "0.145.0"))
+        self.assertFalse(compat.semver_at_least("0.145.0-alpha.9", "0.145.0"))
+        self.assertFalse(compat.semver_at_least("0.144.99-alpha.1", "0.145.0"))
+
+    def test_native_preflight_accepts_new_tail_owned_by_matched_runtime(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (45, 'future runtime-owned migration', 1, X'45', 1)"
+            )
+            connection.commit()
+        with mock.patch.object(
+            compat, "attest_desktop_runtime", return_value=self._native_runtime()
+        ):
+            report = compat.preflight(self.codex_home, self.profile)
+        self.assertEqual(report["decision"], "canary_required")
+        self.assertTrue(report["native_delete"])
+        self.assertTrue(report["allow_expensive_inventory"])
+        self.assertEqual(report["database"]["max_successful_migration"], 45)
+
+    def test_native_preflight_rejects_unpaired_runtime(self) -> None:
+        runtime = self._native_runtime()
+        runtime["ok"] = False
+        runtime["reason"] = "desktop backend mirror hash differs"
+        with mock.patch.object(compat, "attest_desktop_runtime", return_value=runtime):
+            report = compat.preflight(self.codex_home, self.profile)
+        self.assertEqual(report["decision"], "unsupported_update_required")
+        self.assertFalse(report["allow_expensive_inventory"])
+        self.assertTrue(any("hash differs" in reason for reason in report["reasons"]))
+
+    def test_desktop_discovery_rejects_fake_root_and_multiple_processes(self) -> None:
+        package = (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "WindowsApps"
+            / "OpenAI.Codex_fixture_x64__publisher"
+        )
+        valid = {
+            "process_id": 10,
+            "parent_process_id": 9,
+            "executable_path": str(package / "app" / "resources" / "codex.exe"),
+            "command_line": "codex.exe app-server",
+            "parent_name": "ChatGPT.exe",
+            "parent_executable_path": str(package / "app" / "ChatGPT.exe"),
+        }
+        fake = dict(valid)
+        fake["executable_path"] = str(
+            self.root / "Program Files" / "WindowsApps" / "OpenAI.Codex_fake" / "app" / "resources" / "codex.exe"
+        )
+        fake["parent_executable_path"] = str(self.root / "ChatGPT.exe")
+        with mock.patch.object(compat, "run_powershell_json", return_value=[fake]):
+            with self.assertRaises(compat.SafetyError):
+                compat.discover_desktop_app_server()
+        second = dict(valid, process_id=11)
+        with mock.patch.object(
+            compat, "run_powershell_json", return_value=[valid, second]
+        ):
+            with self.assertRaises(compat.SafetyError):
+                compat.discover_desktop_app_server()
+
+    def test_runtime_attestation_ignores_path_powershell(self) -> None:
+        fake = self.root / "powershell.exe"
+        fake.write_bytes(b"not a trusted shell")
+        completed = mock.Mock(returncode=0, stdout="{}\n", stderr="")
+        with (
+            mock.patch.dict(os.environ, {"PATH": str(self.root)}),
+            mock.patch.object(
+                compat.shutil,
+                "which",
+                side_effect=AssertionError("PATH lookup must not be used"),
+            ),
+            mock.patch.object(compat.subprocess, "run", return_value=completed) as run,
+        ):
+            self.assertEqual(compat.run_powershell_json("$null"), {})
+
+        executable = Path(run.call_args.args[0][0])
+        self.assertNotEqual(executable, fake)
+        self.assertEqual(executable.name.casefold(), "powershell.exe")
+        self.assertIn("windowspowershell", str(executable).casefold())
+
+    def test_attestation_requires_exact_openai_publisher(self) -> None:
+        bundled = self.root / "bundled-codex.exe"
+        mirror = self.codex_home / "plugins" / ".plugin-appserver" / "codex.exe"
+        mirror.parent.mkdir(parents=True)
+        bundled.write_bytes(b"same signed fixture")
+        mirror.write_bytes(b"same signed fixture")
+        process = {
+            "process_id": 10,
+            "parent_process_id": 9,
+            "executable_path": str(bundled),
+            "command_line": "codex.exe app-server",
+            "parent_name": "ChatGPT.exe",
+            "parent_executable_path": str(self.root / "ChatGPT.exe"),
+        }
+        signature = {
+            "status": "Valid",
+            "subject": "CN=Attacker, OU=OpenAI OpCo, LLC wildcard lookalike",
+            "publisher": "Attacker",
+            "thumbprint": "A" * 40,
+        }
+        with (
+            mock.patch.object(compat, "discover_desktop_app_server", return_value=process),
+            mock.patch.object(compat, "authenticode_evidence", return_value=signature),
+        ):
+            evidence = compat.attest_desktop_runtime(self.codex_home)
+        self.assertFalse(evidence["ok"])
+        self.assertIn("valid OpenAI signature", str(evidence["reason"]))
+
+    def test_native_diagnosis_requires_backup_and_binds_preflight_database(self) -> None:
+        evidence = self._native_evidence()
+        with (
+            mock.patch.object(
+                compat,
+                "validate_runtime_evidence",
+                return_value=(evidence, [], self.failure_path),
+            ),
+            mock.patch.object(
+                compat, "attest_desktop_runtime", return_value=evidence["runtime"]
+            ),
+        ):
+            missing = compat.diagnose(
+                self.codex_home,
+                self.profile,
+                None,
+                None,
+                None,
+                self.failure_path,
+            )
+        self.assertEqual(missing["decision"], "unsafe_stop")
+        self.assertTrue(any("backup" in reason for reason in missing["reasons"]))
+
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (45, 'post-preflight drift', 1, X'45', 1)"
+            )
+            connection.commit()
+        self._write_backups()
+        with (
+            mock.patch.object(
+                compat,
+                "validate_runtime_evidence",
+                return_value=(evidence, [], self.failure_path),
+            ),
+            mock.patch.object(
+                compat, "attest_desktop_runtime", return_value=evidence["runtime"]
+            ),
+        ):
+            drifted = compat.diagnose(
+                self.codex_home,
+                self.profile,
+                None,
+                None,
+                self.summary_path,
+                self.failure_path,
+            )
+        self.assertEqual(drifted["decision"], "unsafe_stop")
+        self.assertTrue(any("migration ledger changed" in reason for reason in drifted["reasons"]))
+
+    def test_native_preflight_rejects_runtime_before_delete_fix(self) -> None:
+        with mock.patch.object(
+            compat,
+            "attest_desktop_runtime",
+            return_value=self._native_runtime("0.144.0"),
+        ):
+            report = compat.preflight(self.codex_home, self.profile)
+        self.assertEqual(report["decision"], "unsupported_update_required")
+        self.assertFalse(report["native_delete"])
+
+    def test_native_preflight_rejects_temporary_compat_objects(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute("CREATE TABLE agent_jobs (id TEXT PRIMARY KEY)")
+            connection.commit()
+        with mock.patch.object(
+            compat, "attest_desktop_runtime", return_value=self._native_runtime()
+        ):
+            report = compat.preflight(self.codex_home, self.profile)
+        self.assertEqual(report["decision"], "unsupported_update_required")
+        self.assertFalse(report["allow_expensive_inventory"])
+
+    def test_preflight_condition_key_is_stable_for_unchanged_state(self) -> None:
+        runtime = self._native_runtime()
+        with mock.patch.object(compat, "attest_desktop_runtime", return_value=runtime):
+            first = compat.preflight(
+                self.codex_home,
+                self.profile,
+                now=dt.datetime(2026, 8, 3, 1, tzinfo=dt.timezone.utc),
+            )
+            second = compat.preflight(
+                self.codex_home,
+                self.profile,
+                now=dt.datetime(2026, 8, 3, 2, tzinfo=dt.timezone.utc),
+            )
+        self.assertEqual(first["condition_key"], second["condition_key"])
 
     def test_profile_rejects_self_hashed_but_unreviewed_ddl(self) -> None:
         document = json.loads(self.profile.read_text(encoding="utf-8"))
@@ -207,9 +512,9 @@ class CompatibilityFixture(unittest.TestCase):
         with self.assertRaises(compat.SafetyError):
             compat.validate_profile_document(document)
 
-    def test_known_schema_requires_canary_before_workaround(self) -> None:
+    def test_legacy_cli_cannot_start_a_new_canary(self) -> None:
         report = self.diagnose(failure=False, backup=False)
-        self.assertEqual(report["decision"], "canary_required")
+        self.assertEqual(report["decision"], "unsupported_update_required")
 
     def test_exact_failure_and_fresh_backups_are_eligible(self) -> None:
         report = self.diagnose()
@@ -223,6 +528,56 @@ class CompatibilityFixture(unittest.TestCase):
         with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
             connection.execute(
                 "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 42"
+            )
+            connection.commit()
+        report = self.diagnose()
+        self.assertEqual(report["decision"], "unsupported_update_required")
+
+    def test_reviewed_tail_43_44_exact_chain_is_accepted(self) -> None:
+        report = self.diagnose(failure=False, backup=False)
+        self.assertEqual(report["decision"], "unsupported_update_required")
+        self.assertEqual(report["database"]["max_successful_migration"], 44)
+
+    def test_reviewed_tail_wrong_checksum_stops(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 43"
+            )
+            connection.commit()
+        report = self.diagnose()
+        self.assertEqual(report["decision"], "unsupported_update_required")
+
+    def test_reviewed_tail_gap_stops(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute("DELETE FROM _sqlx_migrations WHERE version = 43")
+            connection.commit()
+        report = self.diagnose()
+        self.assertEqual(report["decision"], "unsupported_update_required")
+
+    def test_incomplete_reviewed_tail_stops(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute("DELETE FROM _sqlx_migrations WHERE version = 44")
+            connection.commit()
+        report = self.diagnose()
+        self.assertEqual(report["decision"], "unsupported_update_required")
+
+    def test_unknown_successful_tail_migration_stops(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (45, 'unknown future migration', 1, X'45', 1)"
+            )
+            connection.commit()
+        report = self.diagnose()
+        self.assertEqual(report["decision"], "unsupported_update_required")
+
+    def test_any_failed_migration_row_stops(self) -> None:
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (45, 'failed future migration', 0, X'45', 1)"
             )
             connection.commit()
         report = self.diagnose()
@@ -253,6 +608,16 @@ class CompatibilityFixture(unittest.TestCase):
         report = self.diagnose()
         self.assertEqual(report["decision"], "unsafe_stop")
         self.assertTrue(any("stale" in item for item in report["reasons"]))
+
+    def test_backup_hardlink_to_live_database_stops(self) -> None:
+        backup = self.backup_dir / "state_5.sqlite"
+        backup.unlink()
+        os.link(self.codex_home / "state_5.sqlite", backup)
+
+        report = self.diagnose()
+
+        self.assertEqual(report["decision"], "unsafe_stop")
+        self.assertTrue(any("hardlink" in item for item in report["reasons"]))
 
     def test_stale_failure_evidence_stops(self) -> None:
         old_time = (compat.utc_now() - dt.timedelta(hours=30)).timestamp()
@@ -291,7 +656,7 @@ class CompatibilityFixture(unittest.TestCase):
         ):
             compat.install_compat(install_args)
         inspection = self.diagnose(failure=False, backup=False)
-        self.assertEqual(inspection["decision"], "canary_required")
+        self.assertEqual(inspection["decision"], "unsupported_update_required")
 
     def test_post_commit_output_failure_keeps_commit_pending_journal(self) -> None:
         install_output = self.external / "install-write-failure.json"
@@ -355,6 +720,168 @@ class CompatibilityFixture(unittest.TestCase):
                 connection.execute(compat.DROP_STATEMENTS[name])
             connection.commit()
 
+    def test_install_stops_if_full_migration_ledger_drifts_after_diagnosis(self) -> None:
+        install_output = self.external / "install-ledger-drift.json"
+
+        def drift_ledger(*_args: object, **_kwargs: object) -> None:
+            with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+                connection.execute(
+                    "UPDATE _sqlx_migrations SET execution_time = execution_time + 1 "
+                    "WHERE version = 43"
+                )
+                connection.commit()
+
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(
+                compat,
+                "require_live_codex_version",
+                side_effect=drift_ledger,
+            ),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "migration|ledger|history"),
+        ):
+            compat.install_compat(self._install_args(install_output))
+        self.assertEqual(self._compat_object_names(), set())
+
+    def test_install_stops_if_base_schema_drifts_after_diagnosis(self) -> None:
+        install_output = self.external / "install-schema-drift.json"
+
+        def drift_schema(*_args: object, **_kwargs: object) -> None:
+            with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+                connection.execute("CREATE TABLE unrelated_schema_drift (id INTEGER)")
+                connection.commit()
+
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(
+                compat,
+                "require_live_codex_version",
+                side_effect=drift_schema,
+            ),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "schema"),
+        ):
+            compat.install_compat(self._install_args(install_output))
+        self.assertEqual(self._compat_object_names(), set())
+
+    def test_install_stops_if_schema_cookie_drifts_after_diagnosis(self) -> None:
+        install_output = self.external / "install-schema-cookie-drift.json"
+
+        def drift_schema_cookie(*_args: object, **_kwargs: object) -> None:
+            with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+                connection.execute("PRAGMA schema_version = 103")
+                connection.commit()
+
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(
+                compat,
+                "require_live_codex_version",
+                side_effect=drift_schema_cookie,
+            ),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "schema_version"),
+        ):
+            compat.install_compat(self._install_args(install_output))
+        self.assertEqual(self._compat_object_names(), set())
+
+    def test_remove_stops_if_full_migration_ledger_drifts_after_install(self) -> None:
+        install_output = self.external / "install-before-ledger-drift.json"
+        installed = self._install_legacy(install_output)
+        self.assertIn("migration_history_sha256", installed)
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute(
+                "UPDATE _sqlx_migrations SET execution_time = execution_time + 1 "
+                "WHERE version = 43"
+            )
+            connection.commit()
+
+        removal_args = self._remove_args(
+            install_output, self.external / "remove-ledger-drift.json"
+        )
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(compat, "require_live_codex_version", return_value=None),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "migration|ledger|history"),
+        ):
+            compat.remove_compat(removal_args)
+        self.assertEqual(self._compat_object_names(), compat.KNOWN_OBJECTS)
+
+    def test_remove_stops_if_base_schema_drifts_after_install(self) -> None:
+        install_output = self.external / "install-before-schema-drift.json"
+        installed = self._install_legacy(install_output)
+        self.assertIn("base_schema_sha256", installed)
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN unrelated_drift TEXT")
+            connection.commit()
+
+        removal_args = self._remove_args(
+            install_output, self.external / "remove-schema-drift.json"
+        )
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(compat, "require_live_codex_version", return_value=None),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "schema"),
+        ):
+            compat.remove_compat(removal_args)
+        self.assertEqual(self._compat_object_names(), compat.KNOWN_OBJECTS)
+
+    def test_remove_stops_if_bound_evidence_changes_after_prepare(self) -> None:
+        install_output = self.external / "install-before-evidence-drift.json"
+        self._install_legacy(install_output)
+        removal_args = self._remove_args(
+            install_output, self.external / "remove-evidence-drift.json"
+        )
+        real_write = compat.write_json_exclusive
+
+        def mutate_after_prepare(path: Path, payload: dict[str, object]) -> None:
+            real_write(path, payload)
+            self.failure_path.write_text(
+                self.failure_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+
+        with (
+            mock.patch.object(compat, "read_codex_version", return_value=version_result()),
+            mock.patch.object(compat, "require_live_codex_version", return_value=None),
+            mock.patch.object(
+                compat,
+                "require_repository_profile",
+                side_effect=lambda path: Path(path),
+            ),
+            mock.patch.object(
+                compat,
+                "write_json_exclusive",
+                side_effect=mutate_after_prepare,
+            ),
+            self.assertRaisesRegex(compat.SafetyError, "failure evidence changed"),
+        ):
+            compat.remove_compat(removal_args)
+        self.assertEqual(self._compat_object_names(), compat.KNOWN_OBJECTS)
+
     def test_install_and_remove_exact_objects(self) -> None:
         install_output = self.external / "install-result.json"
         install_args = argparse.Namespace(
@@ -378,6 +905,8 @@ class CompatibilityFixture(unittest.TestCase):
             installed = compat.install_compat(install_args)
         self.assertEqual(installed["status"], "installed")
         self.assertGreater(installed["installed_schema_version"], 0)
+        self.assertRegex(installed["migration_history_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(installed["base_schema_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             set(installed["created_object_rootpages"]), compat.KNOWN_OBJECTS
         )
@@ -422,7 +951,7 @@ class CompatibilityFixture(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(present_after, 0)
         self.assertEqual(quick, "ok")
-        self.assertEqual(migration_max, 42)
+        self.assertEqual(migration_max, 44)
 
 
 if __name__ == "__main__":
