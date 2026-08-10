@@ -943,6 +943,15 @@ def final_verify(
 
 def summarize(results: dict[str, Any]) -> dict[str, Any]:
     entries = results["entries"]
+    skip_reasons: set[str] = set()
+    for item in entries:
+        if item.get("outcome") != "skipped":
+            continue
+        reason = item.get("reason")
+        if isinstance(reason, list):
+            skip_reasons.update(str(value) for value in reason)
+        elif reason:
+            skip_reasons.add(str(reason))
     return {
         "deleted_roots": sum(1 for item in entries if item.get("outcome") == "deleted"),
         "deleted_threads": sum(
@@ -955,13 +964,7 @@ def summarize(results: dict[str, Any]) -> dict[str, Any]:
             for item in entries
             if item.get("outcome") == "deleted"
         ),
-        "skip_reasons": sorted(
-            {
-                str(item.get("reason"))
-                for item in entries
-                if item.get("outcome") == "skipped"
-            }
-        ),
+        "skip_reasons": sorted(skip_reasons),
     }
 
 

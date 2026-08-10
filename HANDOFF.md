@@ -17,4 +17,4 @@ Execution rules:
 - Keep protected IDs as a monotonic union throughout a batch.
 - Every round must complete or directly advance an acceptance criterion. After two no-progress rounds, remove detail and take the smallest action that closes a criterion.
 
-Current next action: follow `CURRENT_TASK.md`.
+Current state: the completed-subagent cleanup redesign and one live run are finished. `CURRENT_TASK.md` is `NONE / IDLE`; wait for a new user request.

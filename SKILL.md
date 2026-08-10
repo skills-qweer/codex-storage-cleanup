@@ -82,7 +82,7 @@ python scripts\cleanup_completed_subagents.py inventory `
   --protect THREAD_ID
 ```
 
-Read `status-targets.json`. Query those task IDs with `wait_threads` in groups of at most eight and `timeoutMs: 0`. Do not use `read_thread` for ordinary status checks; it hydrates unnecessary history. Retry an individual snapshot only when needed. An individual unavailable or changed task becomes an unknown root-local status and is skipped; an unavailable global list/host/source stops the batch.
+Read `status-targets.json`. Use one target per `wait_threads(timeoutMs: 0)` call and schedule at most eight independent calls concurrently. A single multi-target call wakes on the first inactive task and does not prove the other targets' status. Do not use `read_thread` for ordinary status checks; it hydrates unnecessary history. Retry an individual snapshot only when needed. An individual unavailable or changed task becomes an unknown root-local status and is skipped; an unavailable global list/host/source stops the batch.
 
 Write one fresh external `status-evidence.json`:
 

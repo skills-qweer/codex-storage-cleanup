@@ -251,6 +251,22 @@ class CleanupCompletedSubagentsTests(unittest.TestCase):
 
         self.assertEqual(set(results["protected_ids"]), protected)
 
+    def test_summary_flattens_initial_and_runtime_skip_reasons(self) -> None:
+        summary = cleanup.summarize(
+            {
+                "entries": [
+                    {"outcome": "skipped", "reason": ["recently_changed", "status_not_completed"]},
+                    {"outcome": "skipped", "reason": "writer_lock"},
+                ],
+                "stop": None,
+            }
+        )
+
+        self.assertEqual(
+            summary["skip_reasons"],
+            ["recently_changed", "status_not_completed", "writer_lock"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

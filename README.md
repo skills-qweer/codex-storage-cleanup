@@ -58,7 +58,7 @@ python scripts\cleanup_completed_subagents.py inventory `
   --protect CURRENT_TASK_ID
 ```
 
-第二步：按 `status-targets.json`，通过 Codex 应用的 `wait_threads(timeoutMs: 0)` 分批取得最新状态，写入同一运行目录的 `status-evidence.json`。不要为普通状态判断加载完整历史。
+第二步：按 `status-targets.json`，每个任务单独调用一次 `wait_threads(timeoutMs: 0)`，最多并发八个调用，再把结果写入同一运行目录的 `status-evidence.json`。不要把八个任务塞进同一次 wait，也不要为普通状态判断加载完整历史。
 
 第三步：在已有删除授权时直接运行：
 
