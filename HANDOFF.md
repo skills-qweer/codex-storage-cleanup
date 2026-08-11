@@ -17,4 +17,4 @@ Execution rules:
 - Keep protected IDs as a monotonic union throughout a batch.
 - Every round must complete or directly advance an acceptance criterion. After two no-progress rounds, remove detail and take the smallest action that closes a criterion.
 
-Current state: the completed-subagent cleanup redesign and one live run are finished. `CURRENT_TASK.md` is `NONE / IDLE`; wait for a new user request.
+Current state: the completed-subagent cleanup redesign is published. The latest manual run deleted 4 completed roots, skipped 2 interrupted roots, failed 0, reclaimed 7,540,443 bytes, and passed all final checks; evidence is under `C:\Users\13662\Documents\Codex\2026-08-01\codex-storage-cleanup\runs\manual-20260811-230200`. `CURRENT_TASK.md` is `NONE / IDLE`; wait for a new user request.
