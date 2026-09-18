@@ -267,6 +267,60 @@ class CleanupCompletedSubagentsTests(unittest.TestCase):
             ["recently_changed", "status_not_completed", "writer_lock"],
         )
 
+    def runtime_evidence(self) -> dict:
+        metadata = self.executable.stat()
+        return {
+            "schema_version": 3,
+            "native_contract_id": cleanup.NATIVE_CONTRACT_ID,
+            "checked_at": cleanup.now_iso(),
+            "codex_home": str(self.codex_home),
+            "decision": "canary_required", "native_delete": True,
+            "allow_expensive_inventory": True,
+            "condition_key": "current-runtime",
+            "recommended_codex_exe": str(self.executable),
+            "runtime": {
+                "desktop_process": {"process_id": 1234},
+                "executable": {"bytes": metadata.st_size, "mtime_ns": metadata.st_mtime_ns},
+            },
+            "database": cleanup.light_database_fingerprint(self.codex_home),
+        }
+
+    def test_light_fingerprint_uses_the_running_backend_without_a_mirror(self) -> None:
+        fingerprint = cleanup.make_light_fingerprint(self.runtime_evidence(), set())
+        with mock.patch.object(cleanup, "process_exists", return_value=True):
+            result = cleanup.check_light_fingerprint(fingerprint, self.codex_home, set())
+        self.assertEqual(result["condition_key"], "current-runtime")
+
+    def test_light_fingerprint_stops_on_mid_batch_schema_change(self) -> None:
+        fingerprint = cleanup.make_light_fingerprint(self.runtime_evidence(), set())
+        with closing(sqlite3.connect(self.codex_home / "state_5.sqlite")) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN future_feature TEXT")
+        with mock.patch.object(cleanup, "process_exists", return_value=True), self.assertRaises(cleanup.BatchStop) as raised:
+            cleanup.check_light_fingerprint(fingerprint, self.codex_home, set())
+        self.assertEqual(raised.exception.reason, "runtime_mismatch")
+
+    def test_light_fingerprint_stops_when_backend_replaced(self) -> None:
+        fingerprint = cleanup.make_light_fingerprint(self.runtime_evidence(), set())
+        self.executable.write_bytes(b"updated binary")
+        with mock.patch.object(cleanup, "process_exists", return_value=True), self.assertRaises(cleanup.BatchStop) as raised:
+            cleanup.check_light_fingerprint(fingerprint, self.codex_home, set())
+        self.assertEqual(raised.exception.reason, "runtime_mismatch")
+
+    def test_light_fingerprint_stops_when_desktop_process_exits(self) -> None:
+        fingerprint = cleanup.make_light_fingerprint(self.runtime_evidence(), set())
+        with mock.patch.object(cleanup, "process_exists", return_value=False), self.assertRaises(cleanup.BatchStop) as raised:
+            cleanup.check_light_fingerprint(fingerprint, self.codex_home, set())
+        self.assertEqual(raised.exception.reason, "runtime_mismatch")
+
+    def test_old_native_evidence_is_refreshed_not_reused(self) -> None:
+        path = self.root / "preflight.json"
+        report = self.runtime_evidence()
+        path.write_text(json.dumps(report), encoding="utf-8")
+        self.assertIsNotNone(cleanup.fresh_enough_preflight(path, self.codex_home, 900))
+        report["schema_version"] = 2
+        path.write_text(json.dumps(report), encoding="utf-8")
+        self.assertIsNone(cleanup.fresh_enough_preflight(path, self.codex_home, 900))
+
 
 if __name__ == "__main__":
     unittest.main()

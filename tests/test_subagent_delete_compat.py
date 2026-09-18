@@ -94,10 +94,13 @@ class CompatibilityFixture(unittest.TestCase):
                 "installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
                 "success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)"
             )
-            connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT DEFAULT '', "
+                "updated_at INTEGER DEFAULT 0, archived INTEGER DEFAULT 0)"
+            )
             connection.execute(
                 "CREATE TABLE thread_spawn_edges ("
-                "parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL)"
+                "parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL, status TEXT DEFAULT 'completed')"
             )
             connection.execute(
                 "INSERT INTO threads (id) VALUES (?)",
@@ -253,36 +256,34 @@ class CompatibilityFixture(unittest.TestCase):
             }
 
     def _native_runtime(self, version: str = "0.146.0-alpha.9.2") -> dict[str, object]:
-        executable = self.codex_home / "plugins" / ".plugin-appserver" / "codex.exe"
+        executable = self.root / "desktop-backend" / "codex.exe"
         return {
             "captured_at": compat.iso_now(),
             "ok": True,
             "reason": None,
             "desktop_process": {"process_id": 1234},
-            "bundled_backend": {"path": "C:/Program Files/WindowsApps/OpenAI.Codex/app/resources/codex.exe", "sha256": "a" * 64},
-            "mirror": {
+            "executable": {
                 "path": str(executable),
                 "sha256": "a" * 64,
                 "authenticode": {"status": "Valid", "subject": "OpenAI OpCo, LLC"},
             },
             "cli": version_result(version),
+            "capabilities": {"ok": True, "methods": ["initialize", "thread/delete"], "problems": []},
         }
 
     def _native_evidence(self) -> dict[str, object]:
         runtime = self._native_runtime()
         database = compat.inspect_preflight_database(
             self.codex_home / "state_5.sqlite",
-            json.loads(self.profile.read_text(encoding="utf-8"))["native_delete"][
-                "required_migrations"
-            ],
         )
         return {
-            "schema_version": 2,
+            "schema_version": 3,
+            "native_contract_id": compat.NATIVE_CONTRACT_ID,
             "operation": "preflight",
             "decision": "canary_required",
             "native_delete": True,
             "allow_expensive_inventory": True,
-            "recommended_codex_exe": runtime["mirror"]["path"],
+            "recommended_codex_exe": runtime["executable"]["path"],
             "runtime": runtime,
             "database": database,
             "condition_key": "a" * 64,
@@ -336,7 +337,7 @@ class CompatibilityFixture(unittest.TestCase):
         self.assertFalse(report["allow_expensive_inventory"])
         self.assertTrue(any("hash differs" in reason for reason in report["reasons"]))
 
-    def test_desktop_discovery_rejects_fake_root_and_multiple_processes(self) -> None:
+    def test_desktop_discovery_rejects_unsigned_parent_and_multiple_processes(self) -> None:
         package = (
             Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
             / "WindowsApps"
@@ -355,12 +356,18 @@ class CompatibilityFixture(unittest.TestCase):
             self.root / "Program Files" / "WindowsApps" / "OpenAI.Codex_fake" / "app" / "resources" / "codex.exe"
         )
         fake["parent_executable_path"] = str(self.root / "ChatGPT.exe")
-        with mock.patch.object(compat, "run_powershell_json", return_value=[fake]):
+        with (
+            mock.patch.object(compat, "run_powershell_json", return_value=[fake]),
+            mock.patch.object(compat, "authenticode_evidence", return_value={"status": "NotSigned"}),
+        ):
             with self.assertRaises(compat.SafetyError):
                 compat.discover_desktop_app_server()
         second = dict(valid, process_id=11)
-        with mock.patch.object(
-            compat, "run_powershell_json", return_value=[valid, second]
+        with (
+            mock.patch.object(compat, "run_powershell_json", return_value=[valid, second]),
+            mock.patch.object(compat, "authenticode_evidence", return_value={
+                "status": "Valid", "publisher": "OpenAI OpCo, LLC", "thumbprint": "A" * 40,
+            }),
         ):
             with self.assertRaises(compat.SafetyError):
                 compat.discover_desktop_app_server()

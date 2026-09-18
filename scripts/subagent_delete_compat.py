@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
@@ -63,6 +64,12 @@ REVIEWED_TAIL_CHAIN_ID = "codex-state-42-to-44-delete-unrelated-v1"
 REVIEWED_NATIVE_MINIMUM = "0.145.0"
 REVIEWED_UPDATED_AT = "2026-08-03"
 REVIEWED_REVIEW_AFTER = "2026-11-01"
+# Native cleanup follows the running official backend, not a dated legacy profile.
+NATIVE_CONTRACT_ID = "desktop-native-delete-capabilities-v1"
+NATIVE_REQUIRED_COLUMNS = {
+    "threads": {"id", "rollout_path", "updated_at", "archived"},
+    "thread_spawn_edges": {"parent_thread_id", "child_thread_id", "status"},
+}
 REVIEWED_MIGRATIONS = {
     14: (
         "agent jobs",
@@ -955,6 +962,7 @@ $items = @(Get-CimInstance Win32_Process | Where-Object {
     process_id = [int]$_.ProcessId
     parent_process_id = [int]$_.ParentProcessId
     executable_path = [string]$_.ExecutablePath
+    created_at = [string]$_.CreationDate.ToUniversalTime().ToString('o')
     command_line = [string]$_.CommandLine
     parent_name = [string]$parent.Name
     parent_executable_path = [string]$parent.ExecutablePath
@@ -966,37 +974,24 @@ ConvertTo-Json -Compress -Depth 4 -InputObject $items
     if not isinstance(value, list):
         raise SafetyError("Desktop app-server inventory is incomplete")
     candidates: list[dict[str, Any]] = []
-    windowsapps_prefix = (
-        str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WindowsApps" / "OpenAI.Codex_")
-        .replace("/", "\\")
-        .casefold()
-    )
+    parent_signatures: dict[str, dict[str, Any]] = {}
     for item in value:
         if not isinstance(item, dict):
             continue
         executable = item.get("executable_path")
-        parent_name = item.get("parent_name")
         parent_executable = item.get("parent_executable_path")
-        if (
-            not isinstance(executable, str)
-            or not isinstance(parent_name, str)
-            or not isinstance(parent_executable, str)
-        ):
+        if not executable or not isinstance(parent_executable, str) or not parent_executable:
             continue
-        normalized = executable.replace("/", "\\").casefold()
-        normalized_parent = parent_executable.replace("/", "\\").casefold()
-        suffix = "\\app\\resources\\codex.exe"
-        package_root = normalized[: -len(suffix)] if normalized.endswith(suffix) else ""
-        if (
-            parent_name.casefold() == "chatgpt.exe"
-            and normalized.startswith(windowsapps_prefix)
-            and package_root
-            and normalized_parent == package_root + "\\app\\chatgpt.exe"
-        ):
-            candidates.append(item)
+        # Desktop packaging and the backend location can change independently.
+        # The live parent and its signature identify the app, not a directory name.
+        if parent_executable not in parent_signatures:
+            parent_signatures[parent_executable] = authenticode_evidence(Path(parent_executable))
+        signature = parent_signatures[parent_executable]
+        if is_openai_signature(signature):
+            candidates.append({**item, "parent_authenticode": signature})
     if len(candidates) != 1:
         raise SafetyError(
-            "Expected exactly one current OpenAI Codex desktop app-server process"
+            f"Expected one app-server with a signed OpenAI desktop parent; found {len(candidates)}"
         )
     return candidates[0]
 
@@ -1004,6 +999,7 @@ ConvertTo-Json -Compress -Depth 4 -InputObject $items
 def authenticode_evidence(path: Path) -> dict[str, Any]:
     escaped = str(path).replace("'", "''")
     script = (
+        "Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop; "
         f"$s=Get-AuthenticodeSignature -LiteralPath '{escaped}'; "
         "[pscustomobject]@{status=$s.Status.ToString(); "
         "subject=[string]$s.SignerCertificate.Subject; "
@@ -1018,6 +1014,93 @@ def authenticode_evidence(path: Path) -> dict[str, Any]:
     return value
 
 
+def is_openai_signature(signature: dict[str, Any]) -> bool:
+    return (
+        signature.get("status") == "Valid"
+        and signature.get("publisher") == "OpenAI OpCo, LLC"
+        and bool(re.fullmatch(r"[0-9A-Fa-f]{40}", str(signature.get("thumbprint", ""))))
+    )
+
+
+def protocol_shape_problems(document: dict[str, Any]) -> list[str]:
+    """Check only the request shapes the runner sends; allow additive API changes."""
+    def matches(schema: Any, value: Any, depth: int = 0) -> bool:
+        if not isinstance(schema, dict) or depth > 20:
+            return False
+        if isinstance(value, dict) and not set(schema.get("required", [])).issubset(value):
+            return False
+        if "$ref" in schema:
+            reference = schema["$ref"]
+            if not isinstance(reference, str) or not reference.startswith("#/"):
+                return False
+            target: Any = document
+            for key in reference[2:].split("/"):
+                if not isinstance(target, dict):
+                    return False
+                target = target.get(key.replace("~1", "/").replace("~0", "~"), {})
+            return matches(target, value, depth + 1)
+        for union in ("anyOf", "oneOf"):
+            if union in schema:
+                return any(matches(item, value, depth + 1) for item in schema[union])
+        if "allOf" in schema:
+            return bool(schema["allOf"]) and all(matches(item, value, depth + 1) for item in schema["allOf"])
+        if "enum" in schema and value not in schema["enum"]:
+            return False
+        if "const" in schema and value != schema["const"]:
+            return False
+        types = schema.get("type", [])
+        types = [types] if isinstance(types, str) else types
+        actual = "object" if isinstance(value, dict) else (
+            "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int) else "string"
+        )
+        if types and actual not in types and not (actual == "integer" and "number" in types):
+            return False
+        if isinstance(value, dict):
+            properties = schema.get("properties", {})
+            if not set(schema.get("required", [])).issubset(value):
+                return False
+            # Sent fields must still be declared; accepting arbitrary unknown fields
+            # does not establish that threadId, for example, still means anything.
+            return all(key in properties and matches(properties[key], item, depth + 1) for key, item in value.items())
+        return bool(types or "enum" in schema or "const" in schema)
+
+    examples = {
+        "initialize": {
+            "clientInfo": {"name": "codex-storage-cleanup", "version": "2.0"},
+            "capabilities": {"experimentalApi": True},
+        },
+        "thread/delete": {"threadId": "00000000-0000-0000-0000-000000000001"},
+    }
+    requests = document.get("oneOf", document.get("anyOf", []))
+    return [
+        f"app-server request shape is missing or incompatible: {method}"
+        for method, params in examples.items()
+        if not any(matches(schema, {"id": 1, "method": method, "params": params}) for schema in requests)
+    ]
+
+
+def inspect_protocol_capabilities(executable: Path) -> dict[str, Any]:
+    # Schema generation is local tooling, not a running server or a delete probe.
+    # Isolate even its configuration from the user's live CodexHome.
+    with tempfile.TemporaryDirectory(prefix="codex-cleanup-protocol-") as temporary:
+        directory = Path(temporary)
+        environment = os.environ.copy()
+        environment["CODEX_HOME"] = str(directory / "probe-home")
+        try:
+            completed = subprocess.run(
+                [str(executable), "app-server", "generate-json-schema", "--experimental", "--out", str(directory / "schema")],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SafetyError(f"Cannot inspect app-server protocol capabilities: {exc}") from exc
+        if completed.returncode != 0:
+            raise SafetyError(f"App-server schema generation failed: {(completed.stderr or completed.stdout).strip()}")
+        document = load_json(directory / "schema" / "ClientRequest.json")
+        problems = protocol_shape_problems(document)
+        return {"ok": not problems, "methods": ["initialize", "thread/delete"], "problems": problems}
+
+
 def attest_desktop_runtime(codex_home: Path, *, now: dt.datetime | None = None) -> dict[str, Any]:
     now = now or utc_now()
     evidence: dict[str, Any] = {
@@ -1025,101 +1108,48 @@ def attest_desktop_runtime(codex_home: Path, *, now: dt.datetime | None = None) 
         "ok": False,
         "reason": None,
         "desktop_process": None,
-        "bundled_backend": None,
-        "mirror": None,
+        "executable": None,
         "cli": None,
+        "capabilities": None,
     }
     try:
         process = discover_desktop_app_server()
-        bundled = ensure_plain_file(Path(str(process["executable_path"])))
-        mirror = ensure_plain_file(
-            codex_home / "plugins" / ".plugin-appserver" / "codex.exe",
-            chain_root=codex_home,
-        )
-        bundled_stat = bundled.stat()
-        mirror_stat = mirror.stat()
-        bundled_identity = (
-            bundled_stat.st_dev,
-            bundled_stat.st_ino,
-            bundled_stat.st_size,
-            bundled_stat.st_mtime_ns,
-        )
-        mirror_identity = (
-            mirror_stat.st_dev,
-            mirror_stat.st_ino,
-            mirror_stat.st_size,
-            mirror_stat.st_mtime_ns,
-        )
-        if bundled_stat.st_size != mirror_stat.st_size:
-            raise SafetyError("Desktop backend mirror size differs from the running backend")
-        bundled_hash = sha256_file(bundled)
-        mirror_hash = sha256_file(mirror)
-        if bundled_hash != mirror_hash:
-            raise SafetyError("Desktop backend mirror hash differs from the running backend")
-        signature = authenticode_evidence(mirror)
+        executable = ensure_plain_file(Path(str(process["executable_path"])))
+        metadata = executable.stat()
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        signature = authenticode_evidence(executable)
+        if not is_openai_signature(signature):
+            raise SafetyError("Desktop backend lacks a valid OpenAI signature")
+        executable_hash = sha256_file(executable)
+        evidence["desktop_process"] = process
+        evidence["executable"] = {
+            "path": str(executable), "bytes": metadata.st_size,
+            "sha256": executable_hash, "mtime_ns": metadata.st_mtime_ns,
+            "authenticode": signature,
+        }
+        # Version is diagnostic except for the already-known pre-fix releases.
+        evidence["cli"] = read_codex_version(str(executable))
+        capabilities = inspect_protocol_capabilities(executable)
+        evidence["capabilities"] = capabilities
+        if not capabilities["ok"]:
+            raise SafetyError("; ".join(capabilities["problems"]))
+        final_executable = ensure_plain_file(Path(str(process["executable_path"])))
+        final_metadata = final_executable.stat()
+        final_process = discover_desktop_app_server()
         if (
-            signature.get("status") != "Valid"
-            or signature.get("publisher") != "OpenAI OpCo, LLC"
-            or not re.fullmatch(r"[0-9A-Fa-f]{40}", str(signature.get("thumbprint", "")))
+            final_executable != executable
+            or (final_metadata.st_dev, final_metadata.st_ino, final_metadata.st_size, final_metadata.st_mtime_ns) != identity
+            or sha256_file(final_executable) != executable_hash
+            or any(final_process.get(key) != process.get(key) for key in ("process_id", "created_at", "executable_path", "parent_process_id"))
         ):
-            raise SafetyError("Desktop backend mirror lacks a valid OpenAI signature")
-        version = read_codex_version(str(mirror))
-        if not version["ok"]:
-            raise SafetyError(str(version["error"]))
-        final_bundled = ensure_plain_file(Path(str(process["executable_path"])))
-        final_mirror = ensure_plain_file(
-            codex_home / "plugins" / ".plugin-appserver" / "codex.exe",
-            chain_root=codex_home,
-        )
-        final_bundled_stat = final_bundled.stat()
-        final_mirror_stat = final_mirror.stat()
-        if (
-            final_bundled != bundled
-            or final_mirror != mirror
-            or (
-                final_bundled_stat.st_dev,
-                final_bundled_stat.st_ino,
-                final_bundled_stat.st_size,
-                final_bundled_stat.st_mtime_ns,
-            )
-            != bundled_identity
-            or (
-                final_mirror_stat.st_dev,
-                final_mirror_stat.st_ino,
-                final_mirror_stat.st_size,
-                final_mirror_stat.st_mtime_ns,
-            )
-            != mirror_identity
-            or sha256_file(final_bundled) != bundled_hash
-            or sha256_file(final_mirror) != mirror_hash
-        ):
-            raise SafetyError("Desktop runtime files changed during attestation")
-        evidence.update(
-            {
-                "ok": True,
-                "desktop_process": process,
-                "bundled_backend": {
-                    "path": str(bundled),
-                    "bytes": bundled_stat.st_size,
-                    "sha256": bundled_hash,
-                    "mtime_ns": bundled_stat.st_mtime_ns,
-                },
-                "mirror": {
-                    "path": str(mirror),
-                    "bytes": mirror_stat.st_size,
-                    "sha256": mirror_hash,
-                    "mtime_ns": mirror_stat.st_mtime_ns,
-                    "authenticode": signature,
-                },
-                "cli": version,
-            }
-        )
+            raise SafetyError("Desktop runtime changed during attestation; rerun preflight")
+        evidence["ok"] = True
     except (OSError, SafetyError) as exc:
         evidence["reason"] = str(exc)
     return evidence
 
 
-def inspect_preflight_database(database: Path, required: list[dict[str, Any]]) -> dict[str, Any]:
+def inspect_preflight_database(database: Path) -> dict[str, Any]:
     connection = readonly_connection(database)
     try:
         migration_table = connection.execute(
@@ -1139,8 +1169,6 @@ def inspect_preflight_database(database: Path, required: list[dict[str, Any]]) -
                     "FROM _sqlx_migrations ORDER BY version"
                 ).fetchall()
             ]
-        required_versions = {item["version"] for item in required}
-        anchors = [item for item in history if item["version"] in required_versions]
         placeholders = ",".join("?" for _ in KNOWN_OBJECTS)
         present = sorted(
             str(row[0])
@@ -1165,6 +1193,11 @@ def inspect_preflight_database(database: Path, required: list[dict[str, Any]]) -
             }
             for row in schema_rows
         ]
+        missing_columns: dict[str, list[str]] = {}
+        for table, columns in NATIVE_REQUIRED_COLUMNS.items():
+            actual = {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
+            if not columns.issubset(actual):
+                missing_columns[table] = sorted(columns - actual)
         return {
             "schema_version": int(connection.execute("PRAGMA schema_version").fetchone()[0]),
             "migration_table_present": bool(migration_table),
@@ -1174,33 +1207,24 @@ def inspect_preflight_database(database: Path, required: list[dict[str, Any]]) -
                 default=None,
             ),
             "failed_migrations": [item for item in history if item["success"] != 1],
-            "required_migrations": anchors,
             "migration_history_sha256": canonical_json_sha256(history),
             "base_schema_sha256": canonical_json_sha256(base_schema),
             "compatibility_objects_present": present,
+            "missing_required_columns": missing_columns,
         }
     finally:
         connection.close()
 
 
-def required_migration_problems(
-    inspection: dict[str, Any], required: list[dict[str, Any]], *, quick_check: bool
-) -> list[str]:
-    problems: list[str] = []
-    if not inspection.get("migration_table_present"):
-        return ["_sqlx_migrations is missing"]
-    if quick_check and inspection.get("quick_check") != "ok":
-        problems.append(f"state quick_check is {inspection.get('quick_check')!r}")
-    if inspection.get("failed_migrations"):
+def native_database_problems(database: dict[str, Any]) -> list[str]:
+    problems = [
+        f"required cleanup columns missing from {table}: {', '.join(columns)}"
+        for table, columns in database["missing_required_columns"].items()
+    ]
+    if database["failed_migrations"]:
         problems.append("failed migration rows are present")
-    source = inspection.get("required_migrations", inspection.get("migrations", []))
-    rows = {item["version"]: item for item in source if isinstance(item, dict)}
-    for expected in required:
-        actual = rows.get(expected["version"])
-        if actual is None:
-            problems.append(f"required migration {expected['version']} is missing")
-        elif any(actual.get(key) != expected[key] for key in ("description", "success", "checksum_hex")):
-            problems.append(f"migration {expected['version']} differs from the reviewed anchor")
+    if database["compatibility_objects_present"]:
+        problems.append("temporary compatibility objects are present; use separate legacy recovery")
     return problems
 
 
@@ -1213,18 +1237,17 @@ def preflight(
     now = now or utc_now()
     home = canonical(codex_home)
     state_db = require_live_state_database(home, "state_5.sqlite")
-    document, _, resolved_profile = load_profiles(profile_path)
-    native = document["native_delete"]
+    # Keep the optional argument for existing commands; native cleanup does not
+    # load, expire, or relax the frozen legacy recovery profile.
     runtime = attest_desktop_runtime(home, now=now)
-    database = inspect_preflight_database(state_db, native["required_migrations"])
+    database = inspect_preflight_database(state_db)
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "native_contract_id": NATIVE_CONTRACT_ID,
         "operation": "preflight",
         "checked_at": now.isoformat(),
         "codex_home": str(home),
         "state_database": str(state_db),
-        "profile_file": str(resolved_profile),
-        "profile_sha256": sha256_file(resolved_profile),
         "runtime": runtime,
         "database": database,
         "native_delete": False,
@@ -1232,33 +1255,25 @@ def preflight(
         "recommended_codex_exe": None,
         "decision": "unsupported_update_required",
         "reasons": [],
-        "next_action": "Keep automation paused and inspect the preflight evidence.",
+        "next_action": "Inspect the specific runtime or capability failure; do not change the database.",
     }
-    review_after = parse_date(document["review_after"], "document review_after")
-    if now.date() > review_after:
-        report["decision"] = "stale_profile_update_required"
-        report["reasons"].append(f"review deadline {review_after.isoformat()} has passed")
-    elif not runtime["ok"]:
+    if not runtime["ok"]:
         report["reasons"].append(str(runtime["reason"]))
     else:
-        report["reasons"].extend(
-            required_migration_problems(
-                database, native["required_migrations"], quick_check=False
-            )
-        )
-        version = runtime["cli"]["version"]
-        if not semver_at_least(version, native["minimum_codex_cli_version"]):
+        report["reasons"].extend(native_database_problems(database))
+        version = runtime.get("cli", {}).get("version")
+        # This is a one-way exclusion of the documented old partial-delete bug,
+        # not a version allowlist. New versions and version-label formats use capabilities.
+        if version and not semver_at_least(version, REVIEWED_NATIVE_MINIMUM):
             report["reasons"].append(
                 f"matched desktop runtime {version} predates the native delete fix"
             )
-        if database["compatibility_objects_present"]:
-            report["reasons"].append("temporary compatibility objects are present")
         if not report["reasons"]:
             report.update(
                 {
                     "native_delete": True,
                     "allow_expensive_inventory": True,
-                    "recommended_codex_exe": runtime["mirror"]["path"],
+                    "recommended_codex_exe": runtime["executable"]["path"],
                     "decision": "canary_required",
                     "next_action": (
                         "Proceed to fresh activity inventory and external online backups, then use "
@@ -1269,9 +1284,15 @@ def preflight(
     report["condition_key"] = canonical_json_sha256(
         {
             "decision": report["decision"],
+            "native_contract_id": NATIVE_CONTRACT_ID,
             "native_delete": report["native_delete"],
             "runtime_version": runtime.get("cli", {}).get("version") if runtime.get("cli") else None,
-            "runtime_sha256": runtime.get("mirror", {}).get("sha256") if runtime.get("mirror") else None,
+            "runtime_sha256": runtime.get("executable", {}).get("sha256") if runtime.get("executable") else None,
+            "runtime_path": report["recommended_codex_exe"],
+            "desktop_process": {
+                key: (runtime.get("desktop_process") or {}).get(key)
+                for key in ("process_id", "created_at", "parent_process_id")
+            },
             "migration_history_sha256": database["migration_history_sha256"],
             "schema_version": database["schema_version"],
             "base_schema_sha256": database["base_schema_sha256"],
@@ -1301,7 +1322,8 @@ def validate_runtime_evidence(
     except (SafetyError, KeyError, TypeError, ValueError) as exc:
         problems.append(str(exc))
     if (
-        evidence.get("schema_version") != 2
+        evidence.get("schema_version") != 3
+        or evidence.get("native_contract_id") != NATIVE_CONTRACT_ID
         or evidence.get("operation") != "preflight"
         or evidence.get("decision") != "canary_required"
         or evidence.get("native_delete") is not True
@@ -1314,7 +1336,7 @@ def validate_runtime_evidence(
     except SafetyError as exc:
         problems.append(str(exc))
     fresh = preflight(codex_home, profile_path, now=now)
-    for key in ("condition_key", "recommended_codex_exe", "profile_sha256"):
+    for key in ("condition_key", "recommended_codex_exe", "native_contract_id"):
         if evidence.get(key) != fresh.get(key):
             problems.append(f"runtime evidence {key} changed since preflight")
     if fresh.get("decision") != "canary_required" or fresh.get("native_delete") is not True:
@@ -1592,7 +1614,12 @@ def diagnose(
     now = now or utc_now()
     codex_home = canonical(codex_home)
     state_db = require_live_state_database(codex_home, "state_5.sqlite")
-    document, profiles, resolved_profile = load_profiles(profile_path)
+    if runtime_evidence is None:
+        document, profiles, resolved_profile = load_profiles(profile_path)
+    else:
+        document = {"policy": {"runtime_evidence_max_age_minutes": 15, "backup_max_age_minutes": 60}}
+        profiles = []
+        resolved_profile = None
     version = (
         {"ok": False, "version": None, "raw": None, "error": "runtime evidence pending"}
         if runtime_evidence is not None
@@ -1604,8 +1631,8 @@ def diagnose(
         "checked_at": now.isoformat(),
         "codex_home": str(codex_home),
         "state_database": str(state_db),
-        "profile_file": str(resolved_profile),
-        "profile_sha256": sha256_file(resolved_profile),
+        "profile_file": str(resolved_profile) if resolved_profile else None,
+        "profile_sha256": sha256_file(resolved_profile) if resolved_profile else None,
         "tail_certificates_sha256": None,
         "cli": version,
         "matched_profile_id": None,
@@ -1621,7 +1648,7 @@ def diagnose(
 
     if runtime_evidence is not None:
         evidence, evidence_problems, evidence_path = validate_runtime_evidence(
-            runtime_evidence, document, codex_home, resolved_profile, now
+            runtime_evidence, document, codex_home, profile_path, now
         )
         recommended = evidence.get("recommended_codex_exe")
         try:
@@ -1636,10 +1663,10 @@ def diagnose(
                 raise SafetyError(str(current_runtime["reason"]))
             recorded_runtime = evidence.get("runtime", {})
             for section, key in (
-                ("bundled_backend", "path"),
-                ("bundled_backend", "sha256"),
-                ("mirror", "path"),
-                ("mirror", "sha256"),
+                ("executable", "path"),
+                ("executable", "sha256"),
+                ("desktop_process", "process_id"),
+                ("desktop_process", "created_at"),
                 ("cli", "version"),
             ):
                 if current_runtime.get(section, {}).get(key) != recorded_runtime.get(
@@ -1647,7 +1674,7 @@ def diagnose(
                 ).get(key):
                     raise SafetyError(f"matched runtime {section}.{key} changed after preflight")
             version = current_runtime["cli"]
-            recommended = current_runtime["mirror"]["path"]
+            recommended = current_runtime["executable"]["path"]
         except (OSError, SafetyError) as exc:
             evidence_problems.append(str(exc))
         report["cli"] = version
@@ -1658,16 +1685,17 @@ def diagnose(
             "valid": not evidence_problems,
             "problems": evidence_problems,
         }
-        profile = profiles[0]
-        inspection = inspect_database(state_db, profile)
+        inspection = inspect_preflight_database(state_db)
+        with closing(readonly_connection(state_db)) as connection:
+            inspection["quick_check"] = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         report["database"] = inspection
         report["database_identity"] = database_identity(state_db)
         report["matched_profile_id"] = "native-desktop-runtime"
-        native_problems = required_migration_problems(
-            inspection, document["native_delete"]["required_migrations"], quick_check=True
-        )
+        native_problems = native_database_problems(inspection)
+        if inspection["quick_check"] != "ok":
+            native_problems.append(f"state quick_check is {inspection['quick_check']!r}")
         recorded_database = evidence.get("database", {})
-        if inspection["migration_contract_sha256"] != recorded_database.get(
+        if inspection["migration_history_sha256"] != recorded_database.get(
             "migration_history_sha256"
         ):
             native_problems.append("migration ledger changed after the fresh runtime gate")
@@ -1675,9 +1703,6 @@ def diagnose(
             native_problems.append("base schema changed after the fresh runtime gate")
         if inspection["schema_version"] != recorded_database.get("schema_version"):
             native_problems.append("SQLite schema_version changed after the fresh runtime gate")
-        state, object_problems = object_state(inspection, profile)
-        if state != "absent":
-            native_problems.extend(object_problems or ["temporary compatibility objects are present"])
         if failure_evidence is not None:
             native_problems.append(
                 "a native-runtime canary failure is never eligible for the legacy database shim"
@@ -1708,13 +1733,14 @@ def diagnose(
             return report
         report["decision"] = "canary_required"
         report["reasons"].append(
-            "fresh signed desktop runtime pairing and current database anchors match"
+            "fresh signed desktop runtime, protocol capabilities, and required database fields match"
         )
         report["recommended_codex_exe"] = recommended
         report["native_delete"] = True
         report["next_action"] = (
             "Use only the matched recommended executable for exactly one official delete canary. "
-            "Any failure stops the batch without a compatibility install."
+            "Skip unchanged active-writer refusals; stop partial deletion or unknown failures. "
+            "Never install legacy compatibility objects for a native failure."
         )
         return report
 
@@ -2404,7 +2430,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preflight_parser = subparsers.add_parser(
-        "preflight", help="Lightweight read-only desktop-runtime and migration gate"
+        "preflight", help="Read-only signed desktop-runtime, protocol, and database capability check"
     )
     add_common_arguments(preflight_parser)
     preflight_parser.add_argument("--output")

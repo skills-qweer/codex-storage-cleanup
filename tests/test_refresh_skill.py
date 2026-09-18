@@ -20,6 +20,21 @@ SPEC.loader.exec_module(refresh)
 
 
 class RefreshSkillTests(unittest.TestCase):
+    def test_legacy_expiry_alone_does_not_require_native_skill_update(self) -> None:
+        local = {"origin_normalized": refresh.EXPECTED_REMOTE, "head": "a" * 40}
+        with (
+            mock.patch.object(refresh, "inspect_local_repo", return_value=local),
+            mock.patch.object(refresh, "local_update_blockers", return_value=[]),
+            mock.patch.object(refresh, "incident_blockers", return_value=[]),
+            mock.patch.object(refresh, "compatibility_diagnosis", return_value=None),
+            mock.patch.object(refresh, "profile_lifecycle", return_value={"stale": True}),
+            mock.patch.object(refresh, "remote_main_sha", return_value="a" * 40),
+            mock.patch.object(refresh, "remote_relation", return_value="up_to_date"),
+        ):
+            result = refresh.inspect_update(Path("."))
+        self.assertEqual(result["decision"], "up_to_date")
+        self.assertTrue(result["profile_lifecycle"]["stale"])
+
     def test_remote_normalization_accepts_only_canonical_repository_shapes(self) -> None:
         expected = "https://github.com/skills-qweer/codex-storage-cleanup"
         self.assertEqual(

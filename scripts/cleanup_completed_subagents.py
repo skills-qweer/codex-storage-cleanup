@@ -35,6 +35,7 @@ ACTIVE_WRITER_CODE = -32600
 ACTIVE_WRITER_TEXT = "already has an active writer"
 DEFAULT_STATUS_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_MIN_IDLE_SECONDS = 3 * 60 * 60
+NATIVE_CONTRACT_ID = "desktop-native-delete-capabilities-v1"
 
 
 class RootSkip(RuntimeError):
@@ -292,7 +293,9 @@ def run_preflight(codex_home: Path, output: Path) -> dict[str, Any]:
     )
     report = read_json(output)
     if (
-        report.get("decision") != "canary_required"
+        report.get("schema_version") != 3
+        or report.get("native_contract_id") != NATIVE_CONTRACT_ID
+        or report.get("decision") != "canary_required"
         or report.get("allow_expensive_inventory") is not True
         or report.get("native_delete") is not True
         or not report.get("recommended_codex_exe")
@@ -325,6 +328,8 @@ def fresh_enough_preflight(path: Path, codex_home: Path, max_age_seconds: int) -
         same_home = False
     if (
         not same_home
+        or report.get("schema_version") != 3
+        or report.get("native_contract_id") != NATIVE_CONTRACT_ID
         or report.get("decision") != "canary_required"
         or report.get("allow_expensive_inventory") is not True
         or report.get("native_delete") is not True
@@ -385,6 +390,9 @@ def online_backup(codex_home: Path, backup_dir: Path, summary_path: Path) -> dic
 def light_database_fingerprint(codex_home: Path) -> dict[str, Any]:
     try:
         with closing(readonly_connection(codex_home / "state_5.sqlite")) as connection:
+            migration_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'"
+            ).fetchone()
             history = [
                 {
                     "version": int(row[0]),
@@ -396,7 +404,7 @@ def light_database_fingerprint(codex_home: Path) -> dict[str, Any]:
                     "SELECT version, description, success, hex(checksum) "
                     "FROM _sqlx_migrations ORDER BY version"
                 )
-            ]
+            ] if migration_table else []
             return {
                 "schema_version": int(connection.execute("PRAGMA schema_version").fetchone()[0]),
                 "migration_history_sha256": canonical_hash(history),
@@ -426,13 +434,13 @@ def process_exists(process_id: int) -> bool:
 
 def make_light_fingerprint(runtime: dict[str, Any], protected: set[str]) -> dict[str, Any]:
     process = runtime["runtime"]["desktop_process"]
-    mirror = runtime["runtime"]["mirror"]
+    executable = runtime["runtime"]["executable"]
     return {
         "condition_key": runtime["condition_key"],
         "desktop_process_id": int(process["process_id"]),
         "recommended_codex_exe": str(runtime["recommended_codex_exe"]),
-        "mirror_bytes": int(mirror["bytes"]),
-        "mirror_mtime_ns": int(mirror["mtime_ns"]),
+        "runtime_bytes": int(executable["bytes"]),
+        "runtime_mtime_ns": int(executable["mtime_ns"]),
         "schema_version": int(runtime["database"]["schema_version"]),
         "migration_history_sha256": str(runtime["database"]["migration_history_sha256"]),
         "protected_ids_sha256": canonical_hash(sorted(protected)),
@@ -450,8 +458,8 @@ def check_light_fingerprint(
     executable = Path(str(expected["recommended_codex_exe"])).resolve(strict=True)
     metadata = executable.stat()
     if (
-        metadata.st_size != int(expected["mirror_bytes"])
-        or metadata.st_mtime_ns != int(expected["mirror_mtime_ns"])
+        metadata.st_size != int(expected["runtime_bytes"])
+        or metadata.st_mtime_ns != int(expected["runtime_mtime_ns"])
     ):
         raise BatchStop("runtime_mismatch", "recommended runtime file changed")
     database = light_database_fingerprint(codex_home)

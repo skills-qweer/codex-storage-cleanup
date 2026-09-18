@@ -49,6 +49,20 @@ python scripts\maintain_sqlite.py --codex-home 'D:\CodexHome' --database logs_2.
 
 正式入口是 `scripts/cleanup_completed_subagents.py`。日常 native 清理不再使用任务目录里的临时循环。
 
+### Codex 升级后是否需要重新适配
+
+普通升级不需要。技能直接发现并使用当前运行、签名有效的桌面后台，不依赖 WindowsApps 固定路径或 `.plugin-appserver` 镜像。兼容预检读取该后台自己导出的 `initialize` / `thread/delete` 接口定义，只检查清理用到的参数和数据库字段；新增字段、迁移、版本号和同一发布者的证书续期不会触发人工适配。
+
+只读检查：
+
+```powershell
+python scripts\subagent_delete_compat.py preflight --codex-home 'D:\CodexHome'
+```
+
+日常流程没有 profile 日期到期限制，也不固定历史 migration 校验和。仅排除已知存在旧删除缺陷的 `0.145.0` 之前版本。接口或必需数据字段真的发生破坏性变化，才需维护；预检通过后仍需备份和真实 canary，不能把预检当成已成功删除。旧 v2 运行证据不可续跑，应重新盘点。
+
+### 执行流程
+
 第一步：传入当前单调保护集合，做一次 matched-runtime preflight 和强证据盘点：
 
 ```powershell

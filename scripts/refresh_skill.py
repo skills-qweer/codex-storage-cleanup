@@ -804,7 +804,7 @@ def inspect_update(
 
     if blockers:
         decision = "automatic_fast_forward_blocked"
-    elif relation == "up_to_date" and (lifecycle["stale"] or profile_update_required):
+    elif relation == "up_to_date" and profile_update_required:
         decision = "draft_pr_required"
     elif relation == "up_to_date":
         decision = "up_to_date"
@@ -818,6 +818,7 @@ def inspect_update(
         "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "local": local,
         "profile_lifecycle": lifecycle,
+        "profile_lifecycle_scope": "legacy incident recovery only; native cleanup uses live capabilities",
         "compatibility_diagnosis": diagnosis,
         "incident_evidence": incident,
         "remote_main_sha": remote_sha,

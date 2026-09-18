@@ -2,10 +2,10 @@
 
 本说明描述两条彼此隔离的官方删除路径：
 
-- 正常路径使用与当前桌面应用实际运行的 `app-server` 逐字节一致、且 Authenticode 签名有效的镜像；
+- 正常路径直接使用当前桌面应用实际运行、且 Authenticode 签名有效的 `app-server`；
 - legacy 回退只处理已经复现并独立审查过的 `codex 0.142.2` / `agent_jobs` 缺表事故。
 
-机器策略位于 [`subagent-delete-compatibility.json`](subagent-delete-compatibility.json)，legacy 尾迁移证书位于 [`subagent-delete-tail-certificates.json`](subagent-delete-tail-certificates.json)。实际判定必须由 `scripts/subagent_delete_compat.py` 完成，不能只看本文、版本号、路径名或 migration 最大值。
+[`subagent-delete-compatibility.json`](subagent-delete-compatibility.json) 和 [`subagent-delete-tail-certificates.json`](subagent-delete-tail-certificates.json) 是冻结的 legacy 事故恢复配置；其中历史 native 字段保留给旧审计格式校验，不再控制日常预检。实际判定由 `scripts/subagent_delete_compat.py` 完成，不能只看本文、版本号、路径名或 migration 最大值。
 
 ## 为什么旧流程反复失效
 
@@ -30,31 +30,32 @@ python scripts\subagent_delete_compat.py preflight `
   --output 'C:\Codex-cleanup\runtime-preflight.json'
 ```
 
-preflight 只读取进程、两个可执行文件的身份、签名和少量 SQLite migration 证据。它不会运行删除、不会执行 `quick_check`、不会扫描全部 rollout，也不会创建备份。
+preflight 读取实时进程、桌面父进程/后台的签名、实际后台文件身份和少量 SQLite 结构证据。它在隔离临时目录调用该后台的 `app-server generate-json-schema --experimental`，检查本清理器实际发送的请求结构，不启动真实删除探针。不会执行 `quick_check`、扫描全部 rollout 或创建数据库备份。
 
 只有同时满足以下条件，结果才会给出 `allow_expensive_inventory: true`：
 
-- 唯一候选是由 `ChatGPT.exe` 启动、位于当前 `OpenAI.Codex_*` WindowsApps 包内的 `app-server`；
-- `D:\CodexHome\plugins\.plugin-appserver\codex.exe` 及路径链不是 reparse point；
-- 镜像与正在运行的 bundled backend 大小、SHA-256 完全相同；
-- 镜像 Authenticode 状态为 `Valid`，签名者包含 `OpenAI OpCo, LLC`；
-- 从该镜像实时读取的完整 semver 至少为 `0.145.0`，预发布后缀不会被截断；
-- migration 14、15、42 的描述、成功标记和 SHA-384 精确命中，没有失败 migration；
+- 唯一候选是由签名有效的 OpenAI 桌面程序启动的 `app-server`，不限定安装目录或桌面程序文件名；
+- 直接使用该进程的可执行文件，文件不是 reparse point，且 Authenticode 签名为有效的 `OpenAI OpCo, LLC`；
+- 后台导出的接口仍支持清理器实际使用的 `initialize` 和 `thread/delete(threadId)` 请求；允许新增可选参数，拒绝缺少方法、改名参数或新增未满足的必需参数；
+- `threads` 仍具有 `id / rollout_path / updated_at / archived`，`thread_spawn_edges` 仍具有 `parent_thread_id / child_thread_id / status`；允许额外字段和表；
+- 没有失败 migration；不要求历史 migration 编号/校验和，也不限制最大值；
+- 排除已知早于原生删除修复的 `<0.145.0` 后台，其余版本由实际能力判断，没有版本上限或 native 复核截止日期；
 - 四个临时兼容对象全不存在。
 
-正常 native 路径不按“未知尾 migration”停机，因为经过配对的运行时就是当前数据库的拥有者；但它仍必须完成新鲜备份、完整诊断和一个真实官方 canary。preflight 会生成稳定 `condition_key`，供定时任务对相同阻塞条件去重。
+正常 native 路径不按“未知尾 migration”停机，因为所选运行时就是当前桌面后台；仍必须完成新鲜备份和一个真实官方 canary。preflight schema v3 的 `condition_key` 绑定进程身份、后台文件和当前 schema/迁移账本，只在本批内比较，不用于禁止下一批采用新版本。旧 v2 证据需重新盘点，不能直接续跑。
 
 ## 决策矩阵
 
 | 实时条件 | 判定 | 允许动作 |
 | --- | --- | --- |
-| 当前桌面 backend、镜像哈希、有效 OpenAI 签名、最低修复版本和 migration 锚点全部命中 | `canary_required` | 才可开始活动状态盘点、外部备份、完整诊断，并只用 `recommended_codex_exe` 做一个 canary |
-| native canary 报错、超时、锁定或产生任何部分删除 | `unsafe_stop` | 保存原始错误并停止整批；绝不能转用 legacy shim，也不能自动重试 |
+| 当前签名有效的桌面 backend、所需接口和数据库字段兼容 | `canary_required` | 可开始活动状态盘点、外部备份，并只用 `recommended_codex_exe` 做 canary；不代表已经验证真实删除 |
+| writer-lock 或精确 active-writer 拒绝且现场未变 | 跳过当前根 | 继续其他独立根，下一次成功删除才算 canary |
+| native canary 未知错误、超时或部分删除 | `unsafe_stop` | 保存原始错误并停止整批；绝不能转用 legacy shim，也不能自动重试 |
 | legacy `0.142.2`、锚点和精确已审 43/44 尾链命中，但没有既有 canary 失败证据 | `unsupported_update_required` | 该路径仅用于恢复既有事故；返回 native preflight，不能用旧 CLI 新开 canary |
 | legacy 精确缺表错误、部分删除状态、实时 canary 状态和新鲜外部备份全部命中 | `known_workaround_eligible` | 仅凭本次授权和脚本固定口令临时安装四个对象，然后只重试同一个 canary |
 | 四个兼容对象全部精确存在、为空，且有同一事故的匹配 install journal | `compat_installed` | 不得重装；完成同一批次后按匹配 journal 移除 |
-| profile 或证书超过 `review_after` | `stale_profile_update_required` | 保持自动任务暂停，先重新审查技能 |
-| runtime 配对、签名、锚点或 legacy 尾证书不匹配 | `unsupported_update_required` | 不做昂贵盘点/备份；检查可信更新，否则创建经过测试的 Draft PR |
+| legacy profile 或尾证书超过 `review_after` | `stale_profile_update_required` | 仅旧事故恢复需重新审查；不影响日常 native 预检 |
+| runtime 身份、签名、必需接口/字段不兼容，或 legacy 尾证书不匹配 | `unsupported_update_required` | 不做昂贵盘点/备份；按具体错误维护，不因普通升级改规则 |
 | 对象部分存在、账本/schema 漂移、证据失效、备份/`quick_check` 失败 | `unsafe_stop` | 保留现场，禁止自动修库、自动重试或批量删除 |
 
 ## legacy 尾迁移证书
@@ -78,8 +79,8 @@ preflight 只读取进程、两个可执行文件的身份、签名和少量 SQL
 
 ## 更新与定时任务
 
-当前复核截止日为 `2026-11-01`。`refresh_skill.py` 只允许可信仓库的精确 fast-forward，并静态验证 schema v2 profile、固定 native controls 和精确 legacy 尾证书；它不更新 Codex CLI、不打开 Codex 数据库、不调用删除 API，也不自动合并 Draft PR。
+legacy 恢复配置的复核截止日为 `2026-11-01`，不适用于日常 native 清理。`refresh_skill.py` 只允许可信仓库的精确 fast-forward，并保留冻结 legacy 配置/证书的静态校验；单凭 legacy 到期不再提示整个技能必须更新。它不更新 Codex CLI、不打开 Codex 数据库、不调用删除 API，也不自动合并 Draft PR。
 
-定时任务遇到相同的 deny 结果时必须在 preflight 阶段暂停并按 `condition_key` 去重，不能每三小时重复扫描、备份和发送同一告警。脚本不会自行改变自动任务状态；已审更新进入 `main` 并手工完成 preflight/完整诊断验证后，由操作员通过 Codex 自动化控制重新启用，恢复后的运行再执行下一次 canary。
+脚本不会自行创建、暂停或恢复定时任务。是否自动运行遵循用户当前选择；普通 Codex 升级只需下一批重新预检，无需重新授权。若另行配置监控，相同不可操作条件应去重，不重复扫描和备份。
 
-网络、CIM/状态源不完整、签名无效、路径/reparse 异常、仓库脏、证据过期、数据库锁或任何现场漂移都必须 fail closed。
+日常 root-local 跳过和 batch-global 停止规则以 `SKILL.md` 为准。legacy 写入仍保留仓库干净、精确证据和复核窗口等事故级门禁，不能扩散到普通清理。

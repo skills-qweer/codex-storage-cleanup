@@ -14,7 +14,7 @@ Audit first. Treat conversations and user artifacts as data, not cache. Keep nor
 - Resolve every target below the requested CodexHome and refuse reparse points or path escapes.
 - Protect active, interrupted, unknown, recent, or potentially reusable tasks. A completed descendant of an active main task is still eligible when its own whole subtree is independently completed and unprotected.
 - Back up `state_5.sqlite`, `goals_1.sqlite`, and `memories_1.sqlite` with SQLite online backup outside CodexHome before subagent deletion. Keep the compact manifest and results outside CodexHome.
-- Use only the native executable selected by a fresh matched-runtime preflight and prove one real canary before treating later successful deletions as normal batch work.
+- Use only the actual signed desktop backend selected by a fresh capability preflight and prove one real canary before treating later successful deletions as normal batch work.
 - Preserve unrelated user changes.
 
 ## 1. Audit storage
@@ -73,7 +73,7 @@ Use `scripts/cleanup_completed_subagents.py` for the normal native path. Do not 
 
 First query the global app task list and collaboration agents. The sources must be complete. Build a monotonic protected set: add every active, interrupted, unknown, recent, or potentially reusable main/subagent ID, and never remove an ID during the batch merely because it changes from active to idle.
 
-Run inventory into a new directory outside CodexHome. This command performs the batch-start matched-runtime preflight before scanning rollouts:
+Run inventory into a new directory outside CodexHome. This command performs the batch-start capability preflight before scanning rollouts:
 
 ```powershell
 python scripts\cleanup_completed_subagents.py inventory `
@@ -150,9 +150,21 @@ The normal path never installs compatibility objects. Legacy `0.142.2` recovery 
 
 Main and archived conversations remain outside this module even when idle. Deleting them requires a separate, explicitly selected task-ID operation.
 
-## 5. Compatibility freshness and updates
+## 5. Codex updates and compatibility
 
-Run the read-only update check when a preflight reports an unsupported or stale runtime:
+For “does this still work after a Codex update?”, run only the lightweight check:
+
+```powershell
+python scripts\subagent_delete_compat.py preflight --codex-home 'D:\CodexHome'
+```
+
+The native path discovers the live app-server through its signed OpenAI desktop parent and uses that exact signed executable. It does not assume a WindowsApps/AppData layout or require a plugin mirror. It checks the running binary's generated `initialize`/`thread/delete` request shapes and the SQLite fields actually used by cleanup. Schema generation uses a temporary, isolated CodexHome and never calls a delete API.
+
+New version numbers, certificate renewal under the same OpenAI publisher, added API fields, and added successful migrations do not require an update to this skill. Native cleanup has no calendar expiry or historical migration checksum allowlist. Known pre-fix releases below `0.145.0` remain excluded; legacy recovery keeps its separate exact profile and expiry rules.
+
+`canary_required` means the prerequisites pass, not that a real deletion has already succeeded. A missing required method/field, invalid runtime identity, database error, or an in-batch runtime/schema change is a concrete stop. A real breaking API or storage change can still require maintenance; do not promise compatibility with every future release. Native preflight schema v3 replaces old evidence: rebuild the inventory rather than resuming a v2 run.
+
+Check for a skill update only when a concrete incompatibility needs it:
 
 ```powershell
 python scripts\refresh_skill.py check
