@@ -2,6 +2,8 @@
 
 Record only finished, verified outcomes. Do not preserve abandoned or superseded plans here.
 
+- 2026-09-19: Executed the updated native workflow on desktop backend `0.155.0-alpha.9.2`. Deleted 7 roots / 7 completed subagents and reclaimed 51,963,643 bytes (49.56 MiB); skipped 24 roots (16 unknown latest turn, 2 interrupted, 1 failed, 5 completed but archived), failed 0. Official canary and final verification passed; deleted rows/files/spawn edges are absent, all 47 protected records remain readable, and state/goals/memories/logs `quick_check` is `ok`. Post-run logical size is 22,271,400,639 bytes (20.7419 GiB), excluding four reparse directories. Backups and audits remain under `C:\Users\13662\Documents\Codex\2026-08-01\codex-storage-cleanup\runs\manual-20260919T035958Z`; automation remains off.
+
 - 2026-09-19: Replaced fixed desktop installation/mirror discovery and dated native compatibility gates with signed live-backend discovery, generated protocol request-shape checks, and required SQLite field checks. New versions/additive schema changes no longer require profile edits; legacy recovery retains its separate exact rules. All 85 regression tests and skill validation passed. Current `0.155.0-alpha.9.2` returned `canary_required`; an isolated real initialize/thread-list check also passed. No real cleanup, CLI update, or automation change was performed. Evidence: `C:\Users\13662\Documents\Codex\2026-08-01\codex-storage-cleanup\runs\compatibility-20260919-074041\native-preflight.json`.
 
 - 2026-08-03: Paired native deletion with the running signed desktop backend, added reviewed legacy migration-tail evidence, and merged the compatibility hardening through commit `15a0725`.
